@@ -1,0 +1,26 @@
+{
+  "name": "obsidian-rag",
+  "version": "0.1.0",
+  "description": "Local RAG search over PDFs and notes using Ollama or LM Studio",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "test": "jest --passWithNoTests"
+  },
+  "keywords": [],
+  "author": "obsidian-rag",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.5",
+    "obsidian": "latest",
+    "ts-jest": "^29.1.4",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "jest": "^29.7.0"
+  }
+}
