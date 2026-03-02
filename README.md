@@ -43,9 +43,12 @@ Then copy `main.js`, `manifest.json`, and `styles.css` into your vault's `.obsid
 
 You need a running local LLM provider with **both** a chat model and an embedding model loaded.
 
+Before configuring Obsidian RAG, you need to install and run a local provider **and** download both a chat model and an embedding model into it. The plugin cannot download models itself — it connects to whichever provider is already running on your machine.
+
 ### Ollama (recommended)
 
-Install from [ollama.com](https://ollama.com), then pull the models you want:
+1. Install from [ollama.com](https://ollama.com) and start it. Ollama runs as a background service on `http://localhost:11434`.
+2. Pull a chat model and an embedding model:
 
 ```bash
 # Chat model — generates the answers
@@ -55,11 +58,15 @@ ollama pull llama3.2
 ollama pull nomic-embed-text
 ```
 
-Ollama runs on `http://localhost:11434` by default.
+Both models must be pulled before you index your vault or ask questions.
 
 ### LM Studio / MLX
 
-Install from [lmstudio.ai](https://lmstudio.ai). Download a chat model and an embedding model from the model library, then start the **Local Server** (default: `http://localhost:1234`). Make sure both models are loaded before indexing or querying.
+1. Install from [lmstudio.ai](https://lmstudio.ai).
+2. Open LM Studio, go to the **Discover** tab, and download a chat model and an embedding model.
+3. Go to the **Local Server** tab, load both models, and click **Start Server** (default: `http://localhost:1234`).
+
+The server must be running with both models loaded before you index your vault or ask questions.
 
 ---
 
