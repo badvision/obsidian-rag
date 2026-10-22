@@ -19,14 +19,24 @@ Supports [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), or **se
 
 This plugin is not yet in the Obsidian community plugin directory. Install it manually:
 
-### Option A — Pre-built (no Node.js required)
+### Option A — Pre-packaged zip (includes self-hosted ONNX support; recommended)
+
+1. Download `obsidian-rag-v0.3.2.zip` from the [latest release](../../releases/latest).
+2. Unzip it directly into your vault's `.obsidian/plugins/` folder — the archive already contains the `obsidian-rag/` plugin folder, including the `node_modules` the self-hosted ONNX provider needs.
+3. Open Obsidian → **Settings → Community plugins** → turn off Safe Mode if prompted → enable **Obsidian RAG**.
+
+This package ships the ONNX runtime native binding for **macOS on Apple Silicon** only. If you only use Ollama or LM Studio (no ONNX), the three-file Option B works on any platform. On other OS/architectures with ONNX, use Option C and run `npm install` in the plugin folder.
+
+### Option B — Three files (Ollama / LM Studio providers only)
 
 1. Download `main.js`, `manifest.json`, and `styles.css` from the [latest release](../../releases/latest).
 2. In your vault, create the folder `.obsidian/plugins/obsidian-rag/`.
 3. Copy the three files into that folder.
 4. Open Obsidian → **Settings → Community plugins** → turn off Safe Mode if prompted → enable **Obsidian RAG**.
 
-### Option B — Build from source
+Without `node_modules` in the plugin folder, the **Self-hosted ONNX** embedding provider is unavailable — Ollama and LM Studio work normally.
+
+### Option C — Build from source
 
 ```bash
 git clone https://github.com/badvision/obsidian-rag.git
@@ -35,7 +45,7 @@ npm install
 npm run build
 ```
 
-Then copy `main.js`, `manifest.json`, and `styles.css` into your vault's `.obsidian/plugins/obsidian-rag/` folder and enable the plugin as above.
+Then copy `main.js`, `manifest.json`, and `styles.css` into your vault's `.obsidian/plugins/obsidian-rag/` folder (a symlink also works) and enable the plugin as above. The plugin folder's `node_modules` makes the self-hosted ONNX provider available on any platform after `npm install`.
 
 ---
 
@@ -76,7 +86,7 @@ No Ollama, no LM Studio — the plugin runs a small embedding model **inside Obs
 2. Pick a model — curated picks include `all-MiniLM-L6-v2` (384d, fastest), `all-mpnet-base-v2` (768d, strong), `bge-small-en-v1.5` (384d), `paraphrase-multilingual-MiniLM-L12-v2` (384d, multilingual), and `nomic-embed-text-v1.5` int8 (768d — same model family as LM Studio/Ollama nomic). Any Hugging Face repo with an ONNX export works too.
 3. Click **Test Connection**. The model downloads on first use and is cached in the plugin folder (`models/`) — afterwards it works with zero network and zero external processes.
 
-Desktop only: the plugin directory must contain `node_modules` with `@huggingface/transformers`, `onnxruntime-node`, and their dependencies (a development symlink works). Dependencies are loaded lazily using Node's `createRequire` rooted at the absolute installed plugin path; Obsidian's renderer-level `require` does not resolve plugin-local packages. Load failures retain the original dependency error.
+Desktop only: the plugin directory must contain `node_modules` with `@huggingface/transformers` and `onnxruntime-node` — the pre-packaged release zip already includes them (macOS Apple Silicon). Dependencies are loaded lazily via `createRequire` rooted at the absolute installed plugin path, since Obsidian's renderer-level `require` cannot resolve plugin-local packages; load failures retain the original dependency error.
 
 Inference runs on CPU: on Apple Silicon, roughly 4 ms per 300-400-token chunk for the 384d models and 16-21 ms for the 768d models — a 1,000-chunk vault embeds in about 5-20 s. An optional **CoreML** device routes inference through Apple's GPU/ANE and auto-falls back to CPU if a model is unsupported there; on Apple Silicon it measured ~4× slower than CPU for these model sizes (~18-74 ms/chunk), since the EP's per-call overhead dominates at this scale — keep it as headroom for much larger embedding models.
 
