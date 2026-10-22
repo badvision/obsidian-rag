@@ -163,7 +163,10 @@ export class RagModal extends Modal {
     if (err instanceof ProviderError) {
       switch (err.code) {
         case 'CONNECTION_REFUSED':
-          return `Cannot connect to provider at ${this.settings.baseUrl}. Make sure Ollama or LM Studio is running.`;
+          if (this.settings.chatProvider === 'cli') {
+            return 'CLI command failed — check the CLI Command template in settings and use Test Connection to debug it.';
+          }
+          return `Cannot connect to provider at ${this.settings.chatBaseUrl}. Make sure Ollama or LM Studio is running.`;
         case 'MODEL_NOT_FOUND':
           return `Model '${this.settings.chatModel}' not found. Check your settings.`;
         case 'STREAM_ABORTED':

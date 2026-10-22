@@ -1,9 +1,9 @@
 {
   "id": "obsidian-rag",
   "name": "Obsidian RAG",
-  "version": "0.1.0",
+  "version": "0.3.2",
   "minAppVersion": "1.0.0",
-  "description": "Local RAG search over PDFs and notes using Ollama or LM Studio",
+  "description": "Local RAG search over PDFs and notes using Ollama, LM Studio, or a one-shot LLM CLI",
   "author": "obsidian-rag",
   "authorUrl": "",
   "isDesktopOnly": true

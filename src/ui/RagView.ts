@@ -249,7 +249,10 @@ export class RagView extends ItemView {
     if (err instanceof ProviderError) {
       switch (err.code) {
         case 'CONNECTION_REFUSED':
-          return `Cannot connect to ${this.settings.baseUrl}. Is Ollama / LM Studio running?`;
+          if (this.settings.chatProvider === 'cli') {
+            return 'CLI command failed — check the CLI Command template in settings and use Test Connection to debug it.';
+          }
+          return `Cannot connect to ${this.settings.chatBaseUrl}. Is Ollama / LM Studio running?`;
         case 'MODEL_NOT_FOUND':
           return `Model '${this.settings.chatModel}' not found — check settings.`;
         case 'STREAM_ABORTED':

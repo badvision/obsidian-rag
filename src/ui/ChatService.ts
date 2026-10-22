@@ -1,7 +1,8 @@
 import { VectorStore } from '../store/VectorStore';
 import { EmbeddingService } from '../rag/EmbeddingService';
 import { CitationService } from '../rag/CitationService';
-import { IProvider, ChatMessage, ProviderError } from '../providers/types';
+import { ChatMessage, ProviderError } from '../providers/types';
+import type { IChatProvider } from '../providers/types';
 import { RagPluginSettings } from '../settings';
 import { CitationSource } from '../rag/types';
 
@@ -40,7 +41,7 @@ export class ChatService {
   private conversationHistory: ChatMessage[] = [];
 
   constructor(
-    private provider: IProvider,
+    private provider: IChatProvider,
     private vectorStore: VectorStore,
     private embeddingService: EmbeddingService,
     private citationService: CitationService,

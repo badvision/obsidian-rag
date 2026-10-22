@@ -50,7 +50,7 @@ describe('IndexProgressModal', () => {
   test('onOpen: passes settings as first argument to indexAll', () => {
     modal.onOpen();
     const args = mockIndexManager.indexAll.mock.calls[0];
-    expect(args[0]).toMatchObject({ provider: 'ollama' });
+    expect(args[0]).toMatchObject({ chatProvider: 'ollama', embeddingProvider: 'ollama' });
   });
 
   test('onOpen: passes an AbortSignal to indexAll', () => {

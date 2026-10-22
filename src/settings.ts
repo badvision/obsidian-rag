@@ -1,11 +1,31 @@
-import { App, PluginSettingTab, Setting, Notice } from 'obsidian';
-import { createProvider } from './providers/factory';
+import { App, Plugin, PluginSettingTab, Setting, Notice } from 'obsidian';
+import { join } from 'path';
+import type { FileSystemAdapter } from 'obsidian';
+import { createEmbedder, createChatProvider } from './providers/factory';
+import {
+  CliPreset,
+  CLI_PRESETS,
+  CLI_TOKENS,
+  applyCliPreset,
+} from './providers/cli';
+import { ONNX_MODELS, DEFAULT_ONNX_MODEL } from './providers/onnx';
+
+export type EmbeddingProviderName = 'ollama' | 'lmstudio' | 'onnx';
+export type ChatProviderName = 'ollama' | 'lmstudio' | 'cli';
 
 export interface RagPluginSettings {
-  provider: 'ollama' | 'lmstudio';
-  baseUrl: string;
-  chatModel: string;
+  // Embedding role — powers indexing and semantic search
+  embeddingProvider: EmbeddingProviderName;
+  embeddingBaseUrl: string;
   embeddingModel: string;
+  onnxDevice: 'cpu' | 'coreml';
+  // Chat role — generates answers
+  chatProvider: ChatProviderName;
+  chatBaseUrl: string;
+  chatModel: string;
+  cliPreset: CliPreset;
+  cliTemplate: string;
+  // Retrieval / index
   topK: number;
   chunkSize: number;
   chunkOverlap: number;
@@ -17,10 +37,15 @@ export interface RagPluginSettings {
 }
 
 export const DEFAULT_SETTINGS: RagPluginSettings = {
-  provider: 'ollama',
-  baseUrl: 'http://localhost:11434',
-  chatModel: 'llama3.2',
+  embeddingProvider: 'ollama',
+  embeddingBaseUrl: 'http://localhost:11434',
   embeddingModel: 'nomic-embed-text',
+  onnxDevice: 'cpu',
+  chatProvider: 'ollama',
+  chatBaseUrl: 'http://localhost:11434',
+  chatModel: 'llama3.2',
+  cliPreset: 'opencode',
+  cliTemplate: CLI_PRESETS.opencode,
   topK: 20,
   chunkSize: 500,
   chunkOverlap: 50,
@@ -31,15 +56,56 @@ export const DEFAULT_SETTINGS: RagPluginSettings = {
   embeddingDimension: 0,
 };
 
+/**
+ * Migrate settings saved by 0.1.x, which used a single provider for both
+ * roles ({ provider, baseUrl }). Both roles now select independently.
+ */
+export function migrateLegacySettings(raw: Record<string, unknown> | null): Record<string, unknown> {
+  if (!raw) return {};
+  const result: Record<string, unknown> = { ...raw };
+  if (raw.provider !== undefined && raw.embeddingProvider === undefined && raw.chatProvider === undefined) {
+    result.embeddingProvider = raw.provider;
+    result.chatProvider = raw.provider;
+    if (raw.baseUrl !== undefined) {
+      if (result.embeddingBaseUrl === undefined) result.embeddingBaseUrl = raw.baseUrl;
+      if (result.chatBaseUrl === undefined) result.chatBaseUrl = raw.baseUrl;
+    }
+    delete result.provider;
+    delete result.baseUrl;
+  }
+  return result;
+}
+
+const EMBEDDER_DEFAULT_URL: Record<EmbeddingProviderName, string> = {
+  ollama: 'http://localhost:11434',
+  lmstudio: 'http://localhost:1234',
+  onnx: '',
+};
+
+const CHATTER_DEFAULT_URL: Record<Exclude<ChatProviderName, 'cli'>, string> = {
+  ollama: 'http://localhost:11434',
+  lmstudio: 'http://localhost:1234',
+};
+
+/** Minimal surface of the plugin the settings tab needs. */
+export interface SettingTabPlugin {
+  settings: RagPluginSettings;
+  saveSettings: () => Promise<void>;
+  indexAll: () => Promise<void>;
+  manifest: { dir?: string };
+  vectorStore?: { clear: (embeddingModel: string) => Promise<void> };
+}
+
 export class RagSettingTab extends PluginSettingTab {
-  constructor(app: App, private plugin: any) {
-    super(app, plugin);
+  constructor(app: App, private plugin: SettingTabPlugin) {
+    super(app, plugin as unknown as Plugin); // base class requires Plugin; tab only uses the SettingTabPlugin surface
   }
 
   private addModelDropdown(
     containerEl: HTMLElement,
     name: string,
     desc: string,
+    provider: { listModels(): Promise<string[]> },
     getValue: () => string,
     setValue: (v: string) => Promise<void>
   ): void {
@@ -56,7 +122,6 @@ export class RagSettingTab extends PluginSettingTab {
       if (select.value) await setValue(select.value);
     });
 
-    const provider = createProvider(this.plugin.settings);
     provider.listModels().then(models => {
       select.empty();
       if (models.length === 0) {
@@ -87,73 +152,225 @@ export class RagSettingTab extends PluginSettingTab {
 
     containerEl.createEl('h2', { text: 'RAG Plugin Settings' });
 
-    // Provider section
-    containerEl.createEl('h3', { text: 'LLM Provider' });
+    // --- Embedding provider ---
+    containerEl.createEl('h3', { text: 'Embeddings' });
 
     new Setting(containerEl)
-      .setName('Provider')
-      .setDesc('Local LLM provider to use for embeddings and chat')
+      .setName('Embedding Provider')
+      .setDesc('Provider used to build the semantic index')
       .addDropdown(dd => dd
         .addOption('ollama', 'Ollama')
         .addOption('lmstudio', 'LM Studio / MLX')
-        .setValue(this.plugin.settings.provider)
+        .addOption('onnx', 'Self-hosted ONNX (in-process, no server)')
+        .setValue(this.plugin.settings.embeddingProvider)
         .onChange(async (value: string) => {
-          this.plugin.settings.provider = value as 'ollama' | 'lmstudio';
-          this.plugin.settings.baseUrl = value === 'ollama'
-            ? 'http://localhost:11434'
-            : 'http://localhost:1234';
+          this.plugin.settings.embeddingProvider = value as EmbeddingProviderName;
+          this.plugin.settings.embeddingBaseUrl = EMBEDDER_DEFAULT_URL[value as EmbeddingProviderName];
+          if (value === 'onnx' && !ONNX_MODELS[this.plugin.settings.embeddingModel]) {
+            this.plugin.settings.embeddingModel = DEFAULT_ONNX_MODEL;
+          }
           await this.plugin.saveSettings();
           this.display();
         })
       );
 
-    new Setting(containerEl)
-      .setName('Base URL')
-      .setDesc('Provider endpoint URL')
-      .addText(text => text
-        .setValue(this.plugin.settings.baseUrl)
-        .onChange(async (value: string) => {
-          this.plugin.settings.baseUrl = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    this.addModelDropdown(
-      containerEl,
-      'Chat Model',
-      'Model for answer generation',
-      () => this.plugin.settings.chatModel,
-      async (v) => { this.plugin.settings.chatModel = v; await this.plugin.saveSettings(); }
-    );
+    if (this.plugin.settings.embeddingProvider !== 'onnx') {
+      new Setting(containerEl)
+        .setName('Embedding Base URL')
+        .setDesc('Embedding provider endpoint URL')
+        .addText(text => text
+          .setValue(this.plugin.settings.embeddingBaseUrl)
+          .onChange(async (value: string) => {
+            this.plugin.settings.embeddingBaseUrl = value;
+            await this.plugin.saveSettings();
+          })
+        );
+    }
 
     this.addModelDropdown(
       containerEl,
       'Embedding Model',
       'Model for embeddings — changing this requires a full re-index',
+      createEmbedder(this.plugin.settings, join(
+        (this.app.vault.adapter as FileSystemAdapter).getBasePath(), this.plugin.manifest?.dir ?? ''
+      )),
       () => this.plugin.settings.embeddingModel,
       async (v) => { this.plugin.settings.embeddingModel = v; await this.plugin.saveSettings(); }
     );
 
-    // Test connectivity button
+    if (this.plugin.settings.embeddingProvider === 'onnx') {
+      new Setting(containerEl)
+        .setName('ONNX Model Info')
+        .setDesc(
+          `Model downloads on first use (~20-130 MB) and is cached at ` +
+          `${this.plugin.manifest?.dir ?? '.obsidian/plugins/obsidian-rag'}/models/. ` +
+          'No server or network needed afterwards. Runs inside Obsidian — first use of a model takes a few seconds.'
+        );
+      new Setting(containerEl)
+        .setName('ONNX Device')
+        .setDesc(
+          'Where inference runs. CoreML uses Apple Silicon (GPU/ANE) and is much faster; ' +
+          'if a model is unsupported there it automatically falls back to CPU.'
+        )
+        .addDropdown(dd => dd
+          .addOption('cpu', 'CPU (safe, portable)')
+          .addOption('coreml', 'CoreML — Apple GPU/ANE (faster)')
+          .setValue(this.plugin.settings.onnxDevice)
+          .onChange(async (value: string) => {
+            this.plugin.settings.onnxDevice = value as 'cpu' | 'coreml';
+            await this.plugin.saveSettings();
+          })
+        );
+    }
+
+    // --- Chat provider ---
+    containerEl.createEl('h3', { text: 'Chat' });
+
+    new Setting(containerEl)
+      .setName('Chat Provider')
+      .setDesc('Provider used to generate answers')
+      .addDropdown(dd => dd
+        .addOption('ollama', 'Ollama')
+        .addOption('lmstudio', 'LM Studio / MLX')
+        .addOption('cli', 'CLI (OpenCode / OMP / custom)')
+        .setValue(this.plugin.settings.chatProvider)
+        .onChange(async (value: string) => {
+          const provider = value as ChatProviderName;
+          this.plugin.settings.chatProvider = provider;
+          if (provider !== 'cli') {
+            this.plugin.settings.chatBaseUrl = CHATTER_DEFAULT_URL[provider];
+          } else if (this.plugin.settings.cliTemplate === CLI_PRESETS[this.plugin.settings.cliPreset]) {
+            // Only re-apply the preset when the user hasn't customized it
+            this.plugin.settings.cliTemplate = applyCliPreset(this.plugin.settings.cliPreset);
+          }
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+
+    if (this.plugin.settings.chatProvider !== 'cli') {
+      new Setting(containerEl)
+        .setName('Chat Base URL')
+        .setDesc('Chat provider endpoint URL')
+        .addText(text => text
+          .setValue(this.plugin.settings.chatBaseUrl)
+          .onChange(async (value: string) => {
+            this.plugin.settings.chatBaseUrl = value;
+            await this.plugin.saveSettings();
+          })
+        );
+
+      this.addModelDropdown(
+        containerEl,
+        'Chat Model',
+        'Model for answer generation',
+        createChatProvider(this.plugin.settings),
+        () => this.plugin.settings.chatModel,
+        async (v) => { this.plugin.settings.chatModel = v; await this.plugin.saveSettings(); }
+      );
+
+      new Setting(containerEl)
+        .setName('Enable Streaming')
+        .setDesc('Stream answer tokens as they are generated')
+        .addToggle(toggle => toggle
+          .setValue(this.plugin.settings.streamingEnabled)
+          .onChange(async (value: boolean) => {
+            this.plugin.settings.streamingEnabled = value;
+            await this.plugin.saveSettings();
+          })
+        );
+    } else {
+      new Setting(containerEl)
+        .setName('CLI Preset')
+        .setDesc(
+          'Starting point for the command line. ' +
+          'OpenCode/OMP use their one-shot modes; Custom starts as a bare {prompt}.'
+        )
+        .addDropdown(dd => dd
+          .addOption('opencode', 'OpenCode')
+          .addOption('omp', 'OMP')
+          .addOption('custom', 'Custom')
+          .setValue(this.plugin.settings.cliPreset)
+          .onChange(async (value: string) => {
+            this.plugin.settings.cliPreset = value as CliPreset;
+            this.plugin.settings.cliTemplate = applyCliPreset(value as CliPreset);
+            await this.plugin.saveSettings();
+            this.display();
+          })
+        );
+
+      const cliSetting = new Setting(containerEl)
+        .setName('CLI Command')
+        .setDesc(
+          `Full command line. Tokens: ${CLI_TOKENS.join(', ')}. ` +
+          '{prompt} = the whole RAG conversation, {system} = system prompt, ' +
+          '{question} = the current question, {tmpdir} = a throwaway working directory. ' +
+          'Add your own flags (model, agent, …) freely. Saves when you leave the field.'
+        );
+
+      // Own row: as a flex-row child, Obsidian's settings layout collapses a
+      // bare textarea to min-content width (~1 char) — styles.css stacks it.
+      cliSetting.settingEl.addClass('rag-cli-row');
+      const cliInput = cliSetting.controlEl.createEl('textarea', {
+        cls: 'text-input rag-cli-template',
+        attr: { spellcheck: 'false', rows: '4' },
+      });
+      cliInput.value = this.plugin.settings.cliTemplate;
+      cliInput.addEventListener('change', async () => {
+        this.plugin.settings.cliTemplate = cliInput.value;
+        await this.plugin.saveSettings();
+      });
+    }
+
+    // --- Test connection ---
     new Setting(containerEl)
       .setName('Test Connection')
-      .setDesc('Verify provider is reachable and embedding model is loaded')
+      .setDesc('Verify both providers: embedding round-trip, and a real chat round-trip for CLI')
       .addButton(btn => btn
         .setButtonText('Test')
         .onClick(async () => {
           btn.setButtonText('Testing...');
           btn.disabled = true;
           try {
-            const provider = createProvider(this.plugin.settings);
-            const pingResult = await provider.ping();
-            if (!pingResult.reachable) {
-              new Notice(`❌ Provider not reachable: ${pingResult.errorMessage ?? 'connection failed'}`);
-              return;
+            const embedder = createEmbedder(
+              this.plugin.settings,
+              join((this.app.vault.adapter as FileSystemAdapter).getBasePath(), this.plugin.manifest?.dir ?? ''),
+              message => new Notice(message, 3000)
+            );
+            const embedPing = await embedder.ping();
+            if (!embedPing.reachable) {
+              new Notice(
+                `❌ Embeddings: provider not reachable: ${embedPing.errorMessage ?? 'connection failed'}`,
+                10000
+              );
+            } else {
+              const embedResult = await embedder.embed(['test']);
+              new Notice(
+                `✓ Embeddings: ${this.plugin.settings.embeddingModel} returns ${embedResult.dimension}-dim vectors (${embedPing.latencyMs}ms)`,
+                10000
+              );
             }
-            const embedResult = await provider.embed(['test']);
-            new Notice(`✓ Connected — ${this.plugin.settings.embeddingModel} returns ${embedResult.dimension}-dim embeddings (${pingResult.latencyMs}ms)`);
+
+            const chat = createChatProvider(this.plugin.settings);
+            const chatPing = await chat.ping();
+            if (!chatPing.reachable) {
+              new Notice(
+                `❌ Chat: not reachable: ${chatPing.errorMessage ?? 'connection failed'}`,
+                10000
+              );
+            } else if (chatPing.sampleResponse !== undefined) {
+              const sample = chatPing.sampleResponse.length > 120
+                ? chatPing.sampleResponse.slice(0, 117) + '…'
+                : chatPing.sampleResponse;
+              new Notice(
+                `✓ Chat: round-trip OK in ${chatPing.latencyMs}ms — parsed reply: ${sample}`,
+                10000
+              );
+            } else {
+              new Notice(`✓ Chat: provider reachable (${chatPing.latencyMs}ms)`, 10000);
+            }
           } catch (err) {
-            new Notice(`❌ ${(err as Error).message}`);
+            new Notice(`❌ ${(err as Error).message}`, 10000);
           } finally {
             btn.setButtonText('Test');
             btn.disabled = false;
@@ -161,7 +378,7 @@ export class RagSettingTab extends PluginSettingTab {
         })
       );
 
-    // Retrieval section
+    // --- Retrieval ---
     containerEl.createEl('h3', { text: 'Retrieval' });
 
     new Setting(containerEl)
@@ -206,18 +423,6 @@ export class RagSettingTab extends PluginSettingTab {
         })
       );
 
-    // Streaming toggle
-    new Setting(containerEl)
-      .setName('Enable Streaming')
-      .setDesc('Stream answer tokens as they are generated')
-      .addToggle(toggle => toggle
-        .setValue(this.plugin.settings.streamingEnabled)
-        .onChange(async (value: boolean) => {
-          this.plugin.settings.streamingEnabled = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
     // Auto-index toggle
     new Setting(containerEl)
       .setName('Auto-index on Startup')
@@ -230,7 +435,7 @@ export class RagSettingTab extends PluginSettingTab {
         })
       );
 
-    // Index management section
+    // --- Index management ---
     containerEl.createEl('h3', { text: 'Index Management' });
 
     new Setting(containerEl)
@@ -239,13 +444,24 @@ export class RagSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Clear Index')
-      .setDesc('Delete all indexed data. You will need to re-index your documents.')
+      .setDesc('Clear indexed data, or re-index files using the current embedding settings. Unchanged files are skipped.')
       .addButton(btn => btn
         .setButtonText('Clear')
         .onClick(async () => {
           if (confirm('Clear the entire document index? This cannot be undone.')) {
             await this.plugin.vectorStore?.clear(this.plugin.settings.embeddingModel);
             new Notice('Index cleared. Run "RAG: Index all files" to re-index.');
+          }
+        })
+      )
+      .addButton(btn => btn
+        .setButtonText('Re-index')
+        .onClick(async () => {
+          btn.disabled = true;
+          try {
+            await this.plugin.indexAll();
+          } finally {
+            btn.disabled = false;
           }
         })
       );

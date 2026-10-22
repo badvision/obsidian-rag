@@ -1,8 +1,8 @@
 # Obsidian RAG
 
-Local retrieval-augmented generation (RAG) for [Obsidian](https://obsidian.md). Ask questions about your vault — PDFs and Markdown notes — using a fully local LLM and embedding model. No data leaves your machine.
+Local retrieval-augmented generation (RAG) for [Obsidian](https://obsidian.md). Ask questions about your vault — PDFs and Markdown notes — with a local or CLI LLM and a local embedding model. Embeddings stay on your machine; no data leaves it.
 
-Supports [Ollama](https://ollama.com) and [LM Studio](https://lmstudio.ai) as providers.
+Supports [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), or **self-hosted in-process ONNX models** for embeddings, and Ollama, LM Studio, or **any one-shot LLM CLI** (OpenCode, OMP, or your own command) for chat.
 
 ---
 
@@ -11,7 +11,7 @@ Supports [Ollama](https://ollama.com) and [LM Studio](https://lmstudio.ai) as pr
 - Semantic search over PDFs and Markdown notes
 - Section-aware chunking that preserves heading context
 - Streaming answers with inline citations
-- Works entirely offline — no API keys, no cloud
+- Embeddings run fully locally — the index never leaves your machine. Chat can be local or routed through a CLI whose model you already trust.
 
 ---
 
@@ -41,9 +41,9 @@ Then copy `main.js`, `manifest.json`, and `styles.css` into your vault's `.obsid
 
 ## Prerequisites
 
-You need a running local LLM provider with **both** a chat model and an embedding model loaded.
+You need an **embedding provider** with an embedding model — a running local server (Ollama or LM Studio), or **none at all**: the self-hosted ONNX option runs a small embedding model directly inside Obsidian (downloaded once, ~20-130 MB, then fully offline). The **chat** model can come from the same local server *or* from a one-shot LLM CLI you already use (OpenCode, OMP, …), so you can chat through a cloud model your CLI is configured with while embeddings stay local.
 
-Before configuring Obsidian RAG, you need to install and run a local provider **and** download both a chat model and an embedding model into it. The plugin cannot download models itself — it connects to whichever provider is already running on your machine.
+Before configuring Obsidian RAG, start your embedding provider and download an embedding model into it. The plugin cannot download models itself — it connects to whatever is already running or installed on your machine.
 
 ### Ollama (recommended)
 
@@ -68,18 +68,58 @@ Both models must be pulled before you index your vault or ask questions.
 
 The server must be running with both models loaded before you index your vault or ask questions.
 
+### Self-hosted ONNX (no server)
+
+No Ollama, no LM Studio — the plugin runs a small embedding model **inside Obsidian's own process** using [transformers.js](https://huggingface.co/docs/transformers.js) and the ONNX Runtime native bindings.
+
+1. In Settings → Obsidian RAG, choose **Self-hosted ONNX (in-process, no server)** for the Embedding Provider.
+2. Pick a model — curated picks include `all-MiniLM-L6-v2` (384d, fastest), `all-mpnet-base-v2` (768d, strong), `bge-small-en-v1.5` (384d), `paraphrase-multilingual-MiniLM-L12-v2` (384d, multilingual), and `nomic-embed-text-v1.5` int8 (768d — same model family as LM Studio/Ollama nomic). Any Hugging Face repo with an ONNX export works too.
+3. Click **Test Connection**. The model downloads on first use and is cached in the plugin folder (`models/`) — afterwards it works with zero network and zero external processes.
+
+Desktop only: the plugin directory must contain `node_modules` with `@huggingface/transformers`, `onnxruntime-node`, and their dependencies (a development symlink works). Dependencies are loaded lazily using Node's `createRequire` rooted at the absolute installed plugin path; Obsidian's renderer-level `require` does not resolve plugin-local packages. Load failures retain the original dependency error.
+
+Inference runs on CPU: on Apple Silicon, roughly 4 ms per 300-400-token chunk for the 384d models and 16-21 ms for the 768d models — a 1,000-chunk vault embeds in about 5-20 s. An optional **CoreML** device routes inference through Apple's GPU/ANE and auto-falls back to CPU if a model is unsupported there; on Apple Silicon it measured ~4× slower than CPU for these model sizes (~18-74 ms/chunk), since the EP's per-call overhead dominates at this scale — keep it as headroom for much larger embedding models.
+
 ---
 
 ## Configuration
 
 Open **Settings → Obsidian RAG** after enabling the plugin.
 
-### Provider
+### Providers
 
-| Setting | Description |
+The embedding and chat roles are configured **independently** — you can embed locally and chat through a CLI (or vice versa).
+
+**Embeddings** — *Ollama*, *LM Studio / MLX*, or *Self-hosted ONNX* (no server; model runs in-process, downloaded once and cached in the plugin folder). Server providers each have their own Base URL (default `http://localhost:11434` / `http://localhost:1234`).
+
+**Chat** — *Ollama*, *LM Studio / MLX*, or *CLI*.
+
+#### CLI chat provider
+
+Run any one-shot LLM CLI and feed the RAG conversation into it. The command line is a **template** you own — presets are just starting points:
+
+| Preset | Starting template |
 |---|---|
-| **Provider** | Choose *Ollama* or *LM Studio / MLX*. Switching resets the Base URL automatically. |
-| **Base URL** | The HTTP endpoint of your provider. Change this only if you moved the server to a different port or host. |
+| **OpenCode** | `opencode run --format json --dir {tmpdir} {prompt}` |
+| **OMP** | `omp -p --mode json --no-session {prompt}` |
+| **Custom** | `{prompt}` (blank — build your own) |
+
+Tokens available in the template:
+
+| Token | Value |
+|---|---|
+| `{prompt}` | The full RAG conversation (system prompt + retrieved context + question) as one argument |
+| `{system}` | Just the system prompt (e.g. for a `--system-prompt` flag) |
+| `{question}` | Just the user's current question |
+| `{tmpdir}` | A fresh throwaway working directory, so the CLI never starts in your vault |
+
+You can add any flags the tool supports — model selection, agents, etc. For example: `omp -p --mode json --no-session --model gpt-5 {prompt}`.
+
+> **PATH note:** Obsidian launched from the Dock on macOS has a minimal PATH. The plugin auto-detects OpenCode/OMP in common locations (`~/.opencode/bin`, `/opt/homebrew/bin`, `~/.local/bin`, …) and writes the absolute path into the template. If your CLI lives elsewhere, paste its full path into the template.
+
+The **Test Connection** button runs a real round-trip through the template (a minimal prompt with a known expected reply) and shows the parsed response, so you can confirm your command is wired correctly before asking real questions.
+
+Under **Index Management**, **Re-index** sits beside **Clear** and runs the same indexing flow as **RAG: Index all files**, with progress notices and unchanged-file skipping. For a full rebuild, clear the index first, then re-index.
 
 ### LLM model vs. embedding model
 
@@ -97,7 +137,7 @@ Recommended pairings:
 | Balanced | `mistral` (7B) | `nomic-embed-text` |
 | High quality | `phi4` (14B) | `mxbai-embed-large` |
 
-Use the **Test Connection** button to verify both models are reachable and to confirm the embedding dimension before indexing.
+Use the **Test Connection** button to verify both roles before indexing: it probes the embedding provider (and reports the vector dimension) and the chat provider — for a CLI, a full round-trip with the parsed reply shown.
 
 ### Retrieval
 

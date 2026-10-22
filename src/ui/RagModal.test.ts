@@ -173,8 +173,8 @@ describe('RagModal', () => {
     expect(modal.contentEl.querySelector).toHaveBeenCalled();
   });
 
-  test('getErrorMessage: CONNECTION_REFUSED includes the baseUrl from settings', () => {
-    const settings: RagPluginSettings = { ...DEFAULT_SETTINGS, baseUrl: 'http://localhost:9999' };
+  test('getErrorMessage: CONNECTION_REFUSED includes the chatBaseUrl from settings', () => {
+    const settings: RagPluginSettings = { ...DEFAULT_SETTINGS, chatBaseUrl: 'http://localhost:9999' };
     const settingsModal = new RagModal(mockApp, mockQueryService, settings);
     const err = new ProviderError('refused', 'CONNECTION_REFUSED');
     const msg = settingsModal.getErrorMessage(err);

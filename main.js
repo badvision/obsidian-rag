@@ -24,9 +24,11 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian6 = require("obsidian");
+var import_path3 = require("path");
 
 // src/settings.ts
 var import_obsidian3 = require("obsidian");
+var import_path2 = require("path");
 
 // src/providers/ollama.ts
 var import_obsidian = require("obsidian");
@@ -61,20 +63,18 @@ function nodeStreamPost(opts) {
         }
       },
       (res) => {
-        var _a;
-        const status = (_a = res.statusCode) != null ? _a : 0;
+        const status = res.statusCode ?? 0;
         if (status < 200 || status >= 300) {
           let errBody = "";
           res.on("data", (chunk) => {
             errBody += chunk.toString("utf8");
           });
           res.on("end", () => {
-            var _a2, _b, _c;
             let detail = errBody.slice(0, 300);
             try {
               const parsed2 = JSON.parse(errBody);
-              detail = (_c = (_b = (_a2 = parsed2 == null ? void 0 : parsed2.error) == null ? void 0 : _a2.message) != null ? _b : parsed2 == null ? void 0 : parsed2.message) != null ? _c : detail;
-            } catch (e) {
+              detail = parsed2?.error?.message ?? parsed2?.message ?? detail;
+            } catch {
             }
             reject(new Error(`HTTP ${status}: ${detail}`));
           });
@@ -82,10 +82,9 @@ function nodeStreamPost(opts) {
         }
         let buffer = "";
         res.on("data", (chunk) => {
-          var _a2;
           buffer += chunk.toString("utf8");
           const lines = buffer.split("\n");
-          buffer = (_a2 = lines.pop()) != null ? _a2 : "";
+          buffer = lines.pop() ?? "";
           for (const line of lines) {
             if (line.trim()) onLine(line);
           }
@@ -111,12 +110,10 @@ function nodeStreamPost(opts) {
 }
 
 // src/providers/ollama.ts
-var OllamaProvider = class {
-  constructor(baseUrl, chatModel, embeddingModel, streamingEnabled) {
+var OllamaEmbedder = class {
+  constructor(baseUrl, embeddingModel) {
     this.baseUrl = baseUrl;
-    this.chatModel = chatModel;
     this.embeddingModel = embeddingModel;
-    this.streamingEnabled = streamingEnabled;
   }
   async embed(texts) {
     try {
@@ -171,6 +168,43 @@ var OllamaProvider = class {
     }
     return { embeddings, dimension: embeddings[0].length };
   }
+  async listModels() {
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.baseUrl}/api/tags`,
+        method: "GET",
+        throw: false
+      });
+      if (response.status < 200 || response.status >= 300) return [];
+      const models = response.json.models ?? [];
+      return models.map((m) => m.name).sort();
+    } catch {
+      return [];
+    }
+  }
+  async ping() {
+    const start = Date.now();
+    try {
+      const response = await (0, import_obsidian.requestUrl)({
+        url: `${this.baseUrl}/api/version`,
+        method: "GET",
+        throw: false
+      });
+      const latencyMs = Date.now() - start;
+      if (response.status >= 200 && response.status < 300) {
+        return { reachable: true, latencyMs };
+      }
+      return { reachable: false, latencyMs, errorMessage: `HTTP ${response.status}` };
+    } catch (err) {
+      return { reachable: false, latencyMs: 0, errorMessage: err.message };
+    }
+  }
+};
+var OllamaChatProvider = class {
+  constructor(baseUrl, chatModel) {
+    this.baseUrl = baseUrl;
+    this.chatModel = chatModel;
+  }
   async chat(messages, signal, onToken) {
     const body = JSON.stringify({ model: this.chatModel, messages, stream: true });
     let accumulated = "";
@@ -180,15 +214,14 @@ var OllamaProvider = class {
         body,
         signal,
         onLine: (line) => {
-          var _a, _b;
           try {
             const obj = JSON.parse(line);
-            const content = (_b = (_a = obj.message) == null ? void 0 : _a.content) != null ? _b : "";
+            const content = obj.message?.content ?? "";
             if (content) {
-              onToken == null ? void 0 : onToken(content);
+              onToken?.(content);
               accumulated += content;
             }
-          } catch (e) {
+          } catch {
           }
         }
       });
@@ -206,7 +239,6 @@ var OllamaProvider = class {
     return accumulated;
   }
   async listModels() {
-    var _a;
     try {
       const response = await (0, import_obsidian.requestUrl)({
         url: `${this.baseUrl}/api/tags`,
@@ -214,9 +246,9 @@ var OllamaProvider = class {
         throw: false
       });
       if (response.status < 200 || response.status >= 300) return [];
-      const models = (_a = response.json.models) != null ? _a : [];
+      const models = response.json.models ?? [];
       return models.map((m) => m.name).sort();
-    } catch (e) {
+    } catch {
       return [];
     }
   }
@@ -241,12 +273,10 @@ var OllamaProvider = class {
 
 // src/providers/lmstudio.ts
 var import_obsidian2 = require("obsidian");
-var LMStudioProvider = class {
-  constructor(baseUrl, chatModel, embeddingModel, streamingEnabled) {
+var LMStudioEmbedder = class {
+  constructor(baseUrl, embeddingModel) {
     this.baseUrl = baseUrl;
-    this.chatModel = chatModel;
     this.embeddingModel = embeddingModel;
-    this.streamingEnabled = streamingEnabled;
   }
   async embed(texts) {
     try {
@@ -277,6 +307,43 @@ var LMStudioProvider = class {
       );
     }
   }
+  async listModels() {
+    try {
+      const response = await (0, import_obsidian2.requestUrl)({
+        url: `${this.baseUrl}/v1/models`,
+        method: "GET",
+        throw: false
+      });
+      if (response.status < 200 || response.status >= 300) return [];
+      const models = response.json.data ?? [];
+      return models.map((m) => m.id).sort();
+    } catch {
+      return [];
+    }
+  }
+  async ping() {
+    const start = Date.now();
+    try {
+      const response = await (0, import_obsidian2.requestUrl)({
+        url: `${this.baseUrl}/v1/models`,
+        method: "GET",
+        throw: false
+      });
+      const latencyMs = Date.now() - start;
+      if (response.status >= 200 && response.status < 300) {
+        return { reachable: true, latencyMs };
+      }
+      return { reachable: false, latencyMs, errorMessage: `HTTP ${response.status}` };
+    } catch (err) {
+      return { reachable: false, latencyMs: 0, errorMessage: err.message };
+    }
+  }
+};
+var LMStudioChatProvider = class {
+  constructor(baseUrl, chatModel) {
+    this.baseUrl = baseUrl;
+    this.chatModel = chatModel;
+  }
   async chat(messages, signal, onToken) {
     const body = JSON.stringify({ model: this.chatModel, messages, stream: true });
     let accumulated = "";
@@ -287,7 +354,6 @@ var LMStudioProvider = class {
         body,
         signal,
         onLine: (line) => {
-          var _a, _b, _c, _d;
           if (done) return;
           const trimmed = line.trim();
           if (!trimmed.startsWith("data: ")) return;
@@ -298,12 +364,12 @@ var LMStudioProvider = class {
           }
           try {
             const obj = JSON.parse(payload);
-            const content = (_d = (_c = (_b = (_a = obj.choices) == null ? void 0 : _a[0]) == null ? void 0 : _b.delta) == null ? void 0 : _c.content) != null ? _d : "";
+            const content = obj.choices?.[0]?.delta?.content ?? "";
             if (content) {
-              onToken == null ? void 0 : onToken(content);
+              onToken?.(content);
               accumulated += content;
             }
-          } catch (e) {
+          } catch {
           }
         }
       });
@@ -321,7 +387,6 @@ var LMStudioProvider = class {
     return accumulated;
   }
   async listModels() {
-    var _a;
     try {
       const response = await (0, import_obsidian2.requestUrl)({
         url: `${this.baseUrl}/v1/models`,
@@ -329,9 +394,9 @@ var LMStudioProvider = class {
         throw: false
       });
       if (response.status < 200 || response.status >= 300) return [];
-      const models = (_a = response.json.data) != null ? _a : [];
+      const models = response.json.data ?? [];
       return models.map((m) => m.id).sort();
-    } catch (e) {
+    } catch {
       return [];
     }
   }
@@ -354,31 +419,512 @@ var LMStudioProvider = class {
   }
 };
 
-// src/providers/factory.ts
-function createProvider(settings) {
-  if (settings.provider === "ollama") {
-    return new OllamaProvider(
-      settings.baseUrl,
-      settings.chatModel,
-      settings.embeddingModel,
-      settings.streamingEnabled
-    );
-  } else {
-    return new LMStudioProvider(
-      settings.baseUrl,
-      settings.chatModel,
-      settings.embeddingModel,
-      settings.streamingEnabled
+// src/providers/cli.ts
+var cp = require("child_process");
+var fs = require("fs");
+var path = require("path");
+var os = require("os");
+var CLI_TOKENS = ["{prompt}", "{system}", "{question}", "{tmpdir}"];
+var CLI_PRESETS = {
+  opencode: "opencode run --format json --dir {tmpdir} {prompt}",
+  omp: "omp -p --mode json --no-session {prompt}",
+  custom: "{prompt}"
+};
+var CLI_TEMPLATE_PLACEHOLDER = "{prompt}";
+var EXTRA_COMMAND_DIRS = [
+  "~/.opencode/bin",
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "~/.local/bin",
+  "~/.npm-global/bin"
+];
+function applyCliPreset(preset) {
+  if (preset === "custom") return CLI_TEMPLATE_PLACEHOLDER;
+  const template = CLI_PRESETS[preset];
+  const name = template.trim().split(/\s+/)[0];
+  const resolved = resolveCliCommand(name);
+  return resolved ? template.replace(name, resolved) : template;
+}
+function tokenizeCliTemplate(template) {
+  const tokens = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < template.length; i++) {
+    const ch = template[i];
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (/\s/.test(ch) && !inSingle && !inDouble) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (current) tokens.push(current);
+  if (inSingle || inDouble) {
+    throw new ProviderError(
+      "Unbalanced quotes in CLI command template",
+      "UNEXPECTED_RESPONSE"
     );
   }
+  return tokens;
+}
+function expandToken(token, values) {
+  if (token === "{prompt}") return values.prompt;
+  if (token === "{system}") return values.system;
+  if (token === "{question}") return values.question;
+  if (token === "{tmpdir}") return values.tmpdir;
+  let out = token;
+  for (const t of CLI_TOKENS) {
+    out = out.split(t).join(t === "{prompt}" ? values.prompt : t === "{system}" ? values.system : t === "{question}" ? values.question : values.tmpdir);
+  }
+  return out;
+}
+function expandCliTemplate(template, values) {
+  const trimmed = template.trim();
+  if (!trimmed) {
+    throw new ProviderError("CLI command template is empty", "UNEXPECTED_RESPONSE");
+  }
+  if (!trimmed.includes("{prompt}") && !trimmed.includes("{system}") && !trimmed.includes("{question}")) {
+    throw new ProviderError(
+      "CLI command template must contain {prompt} (or {system} / {question})",
+      "UNEXPECTED_RESPONSE"
+    );
+  }
+  const tokens = tokenizeCliTemplate(trimmed);
+  if (tokens.length === 0) {
+    throw new ProviderError("CLI command template is empty", "UNEXPECTED_RESPONSE");
+  }
+  return tokens.map((t) => expandToken(t, values));
+}
+function resolveCliCommand(name) {
+  if (!name) return null;
+  if (name.includes("/")) {
+    return fs.existsSync(name) ? name : null;
+  }
+  const home = os.homedir();
+  const dirs = [];
+  const envPath = process.env.PATH ?? "";
+  for (const dir of envPath.split(":")) {
+    if (dir) dirs.push(dir);
+  }
+  for (const dir of EXTRA_COMMAND_DIRS) {
+    dirs.push(dir.startsWith("~/") ? path.join(home, dir.slice(2)) : dir);
+  }
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+function findTextField(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) {
+    for (let i = value.length - 1; i >= 0; i--) {
+      const found = findTextField(value[i]);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  if (typeof value === "object") {
+    const obj = value;
+    for (const field of ["text", "content", "answer", "output"]) {
+      const candidate = obj[field];
+      if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+    }
+    for (const field of ["content", "message", "messages", "delta", "data", "result", "response"]) {
+      const nested = obj[field];
+      if (nested && typeof nested === "object") {
+        const found = findTextField(nested);
+        if (found !== null) return found;
+      }
+    }
+  }
+  return null;
+}
+function isAssistantEvent(value) {
+  if (value == null || typeof value !== "object") return false;
+  const obj = value;
+  const message = obj["message"];
+  if (message && typeof message === "object") {
+    const role = message["role"];
+    return role === "assistant";
+  }
+  const messages = obj["messages"];
+  if (Array.isArray(messages) && messages.length > 0) {
+    const last = messages[messages.length - 1];
+    return last !== null && typeof last === "object" && last["role"] === "assistant";
+  }
+  return obj["role"] === "assistant";
+}
+function extractCliAnswer(stdout) {
+  const trimmed = stdout.trim();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const found = findTextField(JSON.parse(trimmed));
+      if (found !== null) return found;
+    } catch {
+    }
+  }
+  const lines = trimmed.split("\n").map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.startsWith("{") && !line.startsWith("[")) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isAssistantEvent(parsed)) continue;
+    const found = findTextField(parsed);
+    if (found !== null) return found;
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.startsWith("{") && !line.startsWith("[")) continue;
+    try {
+      const found = findTextField(JSON.parse(line));
+      if (found !== null) return found;
+    } catch {
+    }
+  }
+  return trimmed;
+}
+var CLI_PROBE_PROMPT = "Reply with exactly one word: PONG";
+var _CliChatProvider = class _CliChatProvider {
+  constructor(template, timeoutMs = _CliChatProvider.DEFAULT_TIMEOUT_MS) {
+    this.template = template;
+    this.timeoutMs = timeoutMs;
+  }
+  async run(values, signal, timeoutMs) {
+    if (signal.aborted) {
+      throw new ProviderError("Stream aborted", "STREAM_ABORTED");
+    }
+    const argv = expandCliTemplate(this.template, values);
+    const resolved = resolveCliCommand(argv[0]);
+    if (!resolved) {
+      throw new ProviderError(
+        `Command '${argv[0]}' not found. Enter the full path in the command template (e.g. /opt/homebrew/bin/omp).`,
+        "CONNECTION_REFUSED"
+      );
+    }
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), "obsidian-rag-"));
+    try {
+      return await new Promise((resolve, reject) => {
+        let stdout = "";
+        let stderr = "";
+        let timedOut = false;
+        let settled = false;
+        let child;
+        try {
+          child = cp.spawn(resolved, argv.slice(1), {
+            cwd: tmpdir,
+            env: process.env,
+            stdio: ["ignore", "pipe", "pipe"]
+          });
+          if (!child.stdout || !child.stderr) {
+            child.kill("SIGTERM");
+            reject(new ProviderError(
+              `Could not capture output from '${resolved}'`,
+              "CONNECTION_REFUSED"
+            ));
+            return;
+          }
+          child.stdout.on("data", (d) => {
+            stdout += d.toString("utf8");
+          });
+          child.stderr.on("data", (d) => {
+            stderr += d.toString("utf8");
+          });
+        } catch (err) {
+          reject(new ProviderError(
+            `Failed to launch '${resolved}': ${err.message}`,
+            "CONNECTION_REFUSED",
+            err
+          ));
+          return;
+        }
+        const timer = setTimeout(() => {
+          if (!settled) {
+            timedOut = true;
+            child.kill("SIGTERM");
+          }
+        }, timeoutMs);
+        const onAbort = () => child.kill("SIGTERM");
+        signal.addEventListener("abort", onAbort, { once: true });
+        const cleanup = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", onAbort);
+        };
+        child.on("error", (err) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (signal.aborted) {
+            reject(new ProviderError("Stream aborted", "STREAM_ABORTED", err));
+          } else {
+            reject(new ProviderError(
+              `Failed to launch '${resolved}': ${err.message}`,
+              "CONNECTION_REFUSED",
+              err
+            ));
+          }
+        });
+        child.on("close", (code) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve({
+            stdout,
+            stderr,
+            code: code ?? -1,
+            aborted: signal.aborted,
+            timedOut
+          });
+        });
+      });
+    } finally {
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  }
+  async chat(messages, signal, onToken) {
+    const system = messages.find((m) => m.role === "system")?.content ?? "";
+    const question = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    const prompt = messages.map((m) => m.content).join("\n\n");
+    const result = await this.run({ prompt, system, question, tmpdir: "" }, signal, this.timeoutMs);
+    if (result.aborted) {
+      throw new ProviderError("Stream aborted", "STREAM_ABORTED");
+    }
+    if (result.timedOut) {
+      throw new ProviderError(
+        `CLI command timed out after ${Math.round(this.timeoutMs / 1e3)}s`,
+        "REQUEST_TIMEOUT"
+      );
+    }
+    if (result.code !== 0) {
+      const detail = (result.stderr || result.stdout).trim().slice(0, 300);
+      throw new ProviderError(
+        `CLI exited with code ${result.code}${detail ? `: ${detail}` : ""}`,
+        "UNEXPECTED_RESPONSE"
+      );
+    }
+    const answer = extractCliAnswer(result.stdout);
+    if (!answer) {
+      throw new ProviderError("CLI returned an empty response", "UNEXPECTED_RESPONSE");
+    }
+    onToken?.(answer);
+    return answer;
+  }
+  /**
+   * Round-trip probe: runs a minimal prompt through the real command and
+   * reports the extracted answer in sampleResponse so the user can verify
+   * the template's output is parseable.
+   */
+  async ping() {
+    const start = Date.now();
+    try {
+      const answer = await this.chat(
+        [{ role: "user", content: CLI_PROBE_PROMPT }],
+        new AbortController().signal,
+        void 0
+      );
+      return { reachable: true, latencyMs: Date.now() - start, sampleResponse: answer };
+    } catch (err) {
+      return { reachable: false, latencyMs: 0, errorMessage: err.message };
+    }
+  }
+  async listModels() {
+    return [];
+  }
+};
+_CliChatProvider.DEFAULT_TIMEOUT_MS = 18e4;
+_CliChatProvider.PROBE_TIMEOUT_MS = 6e4;
+var CliChatProvider = _CliChatProvider;
+
+// src/providers/onnx.ts
+var import_path = require("path");
+var import_module = require("module");
+var ONNX_MODELS = {
+  "Xenova/all-MiniLM-L6-v2": { label: "all-MiniLM-L6-v2 (384d, fast, English)", dimension: 384 },
+  "Xenova/all-mpnet-base-v2": { label: "all-mpnet-base-v2 (768d, strong, English)", dimension: 768 },
+  "Xenova/bge-small-en-v1.5": { label: "bge-small-en-v1.5 (384d, strong, English)", dimension: 384 },
+  "Xenova/paraphrase-multilingual-MiniLM-L12-v2": { label: "paraphrase-multilingual-MiniLM-L12-v2 (384d, multilingual)", dimension: 384 },
+  "keisuke-miyako/nomic-embed-text-v1.5-onnx-int8": {
+    label: "nomic-embed-text-v1.5 int8 (768d \u2014 same family as LM Studio nomic)",
+    dimension: 768,
+    load: { subfolder: "", model_file_name: "model_quantized", dtype: "fp32" }
+  }
+};
+var DEFAULT_ONNX_MODEL = "Xenova/all-MiniLM-L6-v2";
+var OnnxEmbedder = class {
+  constructor(options) {
+    this.options = options;
+    this.pipePromise = null;
+  }
+  defaultLoader() {
+    return async () => {
+      const requireFromPlugin = (0, import_module.createRequire)((0, import_path.join)(this.options.pluginDir, "main.js"));
+      const tf = requireFromPlugin("@huggingface/transformers");
+      tf.env.cacheDir = (0, import_path.join)(this.options.pluginDir, "models");
+      return tf;
+    };
+  }
+  loadPipeline() {
+    if (!this.pipePromise) {
+      this.pipePromise = this.load().then((pipe) => {
+        this.options.onProgress?.(`Embedding model ready (${this.options.model})`);
+        return pipe;
+      }).catch((err) => {
+        this.pipePromise = null;
+        throw err;
+      });
+    }
+    return this.pipePromise;
+  }
+  async load() {
+    let tf;
+    try {
+      tf = await (this.options.loader ?? this.defaultLoader())();
+    } catch (err) {
+      throw this.wrapLoadError(err);
+    }
+    const load = ONNX_MODELS[this.options.model]?.load;
+    const dtypes = load?.dtype ? [load.dtype] : ["q8", "fp32"];
+    const preferred = this.options.device ?? "cpu";
+    const devices = preferred === "coreml" ? ["coreml", "cpu"] : ["cpu"];
+    let lastErr = null;
+    for (const device of devices) {
+      for (const dtype of dtypes) {
+        try {
+          return await this.createPipeline(tf, { device, dtype, ...this.fileOptions() });
+        } catch (err) {
+          lastErr = err;
+          this.options.onProgress?.(
+            `ONNX load failed (${device}/${dtype}), trying next variant: ${err.message}`
+          );
+        }
+      }
+    }
+    throw this.wrapLoadError(lastErr);
+  }
+  /** File-layout overrides for repos with a non-standard ONNX layout. */
+  fileOptions() {
+    const load = ONNX_MODELS[this.options.model]?.load;
+    return load?.subfolder !== void 0 || load?.model_file_name !== void 0 ? { subfolder: load?.subfolder, model_file_name: load?.model_file_name } : {};
+  }
+  async createPipeline(tf, opts) {
+    const progress = this.options.onProgress;
+    return await tf.pipeline("feature-extraction", this.options.model, {
+      ...opts,
+      progress_callback: (p) => {
+        const file = typeof p.file === "string" ? p.file : "";
+        if (p.status === "progress" && file) {
+          const pct = typeof p.progress === "number" ? Math.round(p.progress) : 0;
+          progress?.(`Downloading ${file} for ${this.options.model}: ${pct}%`);
+        }
+      }
+    });
+  }
+  /** Maps raw load/loader failures to actionable ProviderErrors. */
+  wrapLoadError(err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return new ProviderError(
+      `Failed to load embedding model '${this.options.model}': ${message}`,
+      "MODEL_NOT_FOUND",
+      err
+    );
+  }
+  async embed(texts) {
+    const pipe = await this.loadPipeline();
+    const embeddings = [];
+    for (const text of texts) {
+      let out;
+      try {
+        out = await pipe(text, { pooling: "mean", normalize: true });
+      } catch (err) {
+        throw new ProviderError(
+          `ONNX inference failed: ${err.message ?? String(err)}`,
+          "UNEXPECTED_RESPONSE",
+          err
+        );
+      }
+      embeddings.push(Array.from(out.data));
+    }
+    return { embeddings, dimension: embeddings[0].length };
+  }
+  /**
+   * Full round-trip: loads (and on first run downloads) the model, then embeds
+   * a sample. Doubles as the "Test Connection" probe for this provider.
+   */
+  async ping() {
+    const start = Date.now();
+    try {
+      const result = await this.embed(["round-trip probe"]);
+      return {
+        reachable: true,
+        latencyMs: Date.now() - start,
+        sampleResponse: `${result.dimension}-dim vector`
+      };
+    } catch (err) {
+      return {
+        reachable: false,
+        latencyMs: Date.now() - start,
+        errorMessage: err instanceof ProviderError ? err.message : err.message
+      };
+    }
+  }
+  async listModels() {
+    return Object.keys(ONNX_MODELS);
+  }
+};
+
+// src/providers/factory.ts
+function createEmbedder(settings, pluginDir, onProgress) {
+  if (settings.embeddingProvider === "lmstudio") {
+    return new LMStudioEmbedder(settings.embeddingBaseUrl, settings.embeddingModel);
+  }
+  if (settings.embeddingProvider === "onnx") {
+    return new OnnxEmbedder({
+      model: settings.embeddingModel,
+      pluginDir: pluginDir ?? "",
+      onProgress,
+      device: settings.onnxDevice
+    });
+  }
+  return new OllamaEmbedder(settings.embeddingBaseUrl, settings.embeddingModel);
+}
+function createChatProvider(settings) {
+  if (settings.chatProvider === "lmstudio") {
+    return new LMStudioChatProvider(settings.chatBaseUrl, settings.chatModel);
+  }
+  if (settings.chatProvider === "cli") {
+    return new CliChatProvider(settings.cliTemplate);
+  }
+  return new OllamaChatProvider(settings.chatBaseUrl, settings.chatModel);
 }
 
 // src/settings.ts
 var DEFAULT_SETTINGS = {
-  provider: "ollama",
-  baseUrl: "http://localhost:11434",
-  chatModel: "llama3.2",
+  embeddingProvider: "ollama",
+  embeddingBaseUrl: "http://localhost:11434",
   embeddingModel: "nomic-embed-text",
+  onnxDevice: "cpu",
+  chatProvider: "ollama",
+  chatBaseUrl: "http://localhost:11434",
+  chatModel: "llama3.2",
+  cliPreset: "opencode",
+  cliTemplate: CLI_PRESETS.opencode,
   topK: 20,
   chunkSize: 500,
   chunkOverlap: 50,
@@ -388,12 +934,36 @@ var DEFAULT_SETTINGS = {
   indexVersion: 1,
   embeddingDimension: 0
 };
+function migrateLegacySettings(raw) {
+  if (!raw) return {};
+  const result = { ...raw };
+  if (raw.provider !== void 0 && raw.embeddingProvider === void 0 && raw.chatProvider === void 0) {
+    result.embeddingProvider = raw.provider;
+    result.chatProvider = raw.provider;
+    if (raw.baseUrl !== void 0) {
+      if (result.embeddingBaseUrl === void 0) result.embeddingBaseUrl = raw.baseUrl;
+      if (result.chatBaseUrl === void 0) result.chatBaseUrl = raw.baseUrl;
+    }
+    delete result.provider;
+    delete result.baseUrl;
+  }
+  return result;
+}
+var EMBEDDER_DEFAULT_URL = {
+  ollama: "http://localhost:11434",
+  lmstudio: "http://localhost:1234",
+  onnx: ""
+};
+var CHATTER_DEFAULT_URL = {
+  ollama: "http://localhost:11434",
+  lmstudio: "http://localhost:1234"
+};
 var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
-  addModelDropdown(containerEl, name, desc, getValue, setValue) {
+  addModelDropdown(containerEl, name, desc, provider, getValue, setValue) {
     const setting = new import_obsidian3.Setting(containerEl).setName(name).setDesc(desc);
     const select = setting.controlEl.createEl("select", { cls: "dropdown" });
     const loadingOpt = select.createEl("option", { text: "Loading models\u2026", value: "" });
@@ -403,7 +973,6 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
     select.addEventListener("change", async () => {
       if (select.value) await setValue(select.value);
     });
-    const provider = createProvider(this.plugin.settings);
     provider.listModels().then((models) => {
       select.empty();
       if (models.length === 0) {
@@ -428,61 +997,160 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
     });
   }
   display() {
-    var _a, _b;
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "RAG Plugin Settings" });
-    containerEl.createEl("h3", { text: "LLM Provider" });
-    new import_obsidian3.Setting(containerEl).setName("Provider").setDesc("Local LLM provider to use for embeddings and chat").addDropdown(
-      (dd) => dd.addOption("ollama", "Ollama").addOption("lmstudio", "LM Studio / MLX").setValue(this.plugin.settings.provider).onChange(async (value) => {
-        this.plugin.settings.provider = value;
-        this.plugin.settings.baseUrl = value === "ollama" ? "http://localhost:11434" : "http://localhost:1234";
+    containerEl.createEl("h3", { text: "Embeddings" });
+    new import_obsidian3.Setting(containerEl).setName("Embedding Provider").setDesc("Provider used to build the semantic index").addDropdown(
+      (dd) => dd.addOption("ollama", "Ollama").addOption("lmstudio", "LM Studio / MLX").addOption("onnx", "Self-hosted ONNX (in-process, no server)").setValue(this.plugin.settings.embeddingProvider).onChange(async (value) => {
+        this.plugin.settings.embeddingProvider = value;
+        this.plugin.settings.embeddingBaseUrl = EMBEDDER_DEFAULT_URL[value];
+        if (value === "onnx" && !ONNX_MODELS[this.plugin.settings.embeddingModel]) {
+          this.plugin.settings.embeddingModel = DEFAULT_ONNX_MODEL;
+        }
         await this.plugin.saveSettings();
         this.display();
       })
     );
-    new import_obsidian3.Setting(containerEl).setName("Base URL").setDesc("Provider endpoint URL").addText(
-      (text) => text.setValue(this.plugin.settings.baseUrl).onChange(async (value) => {
-        this.plugin.settings.baseUrl = value;
-        await this.plugin.saveSettings();
-      })
-    );
-    this.addModelDropdown(
-      containerEl,
-      "Chat Model",
-      "Model for answer generation",
-      () => this.plugin.settings.chatModel,
-      async (v) => {
-        this.plugin.settings.chatModel = v;
-        await this.plugin.saveSettings();
-      }
-    );
+    if (this.plugin.settings.embeddingProvider !== "onnx") {
+      new import_obsidian3.Setting(containerEl).setName("Embedding Base URL").setDesc("Embedding provider endpoint URL").addText(
+        (text) => text.setValue(this.plugin.settings.embeddingBaseUrl).onChange(async (value) => {
+          this.plugin.settings.embeddingBaseUrl = value;
+          await this.plugin.saveSettings();
+        })
+      );
+    }
     this.addModelDropdown(
       containerEl,
       "Embedding Model",
       "Model for embeddings \u2014 changing this requires a full re-index",
+      createEmbedder(this.plugin.settings, (0, import_path2.join)(
+        this.app.vault.adapter.getBasePath(),
+        this.plugin.manifest?.dir ?? ""
+      )),
       () => this.plugin.settings.embeddingModel,
       async (v) => {
         this.plugin.settings.embeddingModel = v;
         await this.plugin.saveSettings();
       }
     );
-    new import_obsidian3.Setting(containerEl).setName("Test Connection").setDesc("Verify provider is reachable and embedding model is loaded").addButton(
+    if (this.plugin.settings.embeddingProvider === "onnx") {
+      new import_obsidian3.Setting(containerEl).setName("ONNX Model Info").setDesc(
+        `Model downloads on first use (~20-130 MB) and is cached at ${this.plugin.manifest?.dir ?? ".obsidian/plugins/obsidian-rag"}/models/. No server or network needed afterwards. Runs inside Obsidian \u2014 first use of a model takes a few seconds.`
+      );
+      new import_obsidian3.Setting(containerEl).setName("ONNX Device").setDesc(
+        "Where inference runs. CoreML uses Apple Silicon (GPU/ANE) and is much faster; if a model is unsupported there it automatically falls back to CPU."
+      ).addDropdown(
+        (dd) => dd.addOption("cpu", "CPU (safe, portable)").addOption("coreml", "CoreML \u2014 Apple GPU/ANE (faster)").setValue(this.plugin.settings.onnxDevice).onChange(async (value) => {
+          this.plugin.settings.onnxDevice = value;
+          await this.plugin.saveSettings();
+        })
+      );
+    }
+    containerEl.createEl("h3", { text: "Chat" });
+    new import_obsidian3.Setting(containerEl).setName("Chat Provider").setDesc("Provider used to generate answers").addDropdown(
+      (dd) => dd.addOption("ollama", "Ollama").addOption("lmstudio", "LM Studio / MLX").addOption("cli", "CLI (OpenCode / OMP / custom)").setValue(this.plugin.settings.chatProvider).onChange(async (value) => {
+        const provider = value;
+        this.plugin.settings.chatProvider = provider;
+        if (provider !== "cli") {
+          this.plugin.settings.chatBaseUrl = CHATTER_DEFAULT_URL[provider];
+        } else if (this.plugin.settings.cliTemplate === CLI_PRESETS[this.plugin.settings.cliPreset]) {
+          this.plugin.settings.cliTemplate = applyCliPreset(this.plugin.settings.cliPreset);
+        }
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    if (this.plugin.settings.chatProvider !== "cli") {
+      new import_obsidian3.Setting(containerEl).setName("Chat Base URL").setDesc("Chat provider endpoint URL").addText(
+        (text) => text.setValue(this.plugin.settings.chatBaseUrl).onChange(async (value) => {
+          this.plugin.settings.chatBaseUrl = value;
+          await this.plugin.saveSettings();
+        })
+      );
+      this.addModelDropdown(
+        containerEl,
+        "Chat Model",
+        "Model for answer generation",
+        createChatProvider(this.plugin.settings),
+        () => this.plugin.settings.chatModel,
+        async (v) => {
+          this.plugin.settings.chatModel = v;
+          await this.plugin.saveSettings();
+        }
+      );
+      new import_obsidian3.Setting(containerEl).setName("Enable Streaming").setDesc("Stream answer tokens as they are generated").addToggle(
+        (toggle) => toggle.setValue(this.plugin.settings.streamingEnabled).onChange(async (value) => {
+          this.plugin.settings.streamingEnabled = value;
+          await this.plugin.saveSettings();
+        })
+      );
+    } else {
+      new import_obsidian3.Setting(containerEl).setName("CLI Preset").setDesc(
+        "Starting point for the command line. OpenCode/OMP use their one-shot modes; Custom starts as a bare {prompt}."
+      ).addDropdown(
+        (dd) => dd.addOption("opencode", "OpenCode").addOption("omp", "OMP").addOption("custom", "Custom").setValue(this.plugin.settings.cliPreset).onChange(async (value) => {
+          this.plugin.settings.cliPreset = value;
+          this.plugin.settings.cliTemplate = applyCliPreset(value);
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+      const cliSetting = new import_obsidian3.Setting(containerEl).setName("CLI Command").setDesc(
+        `Full command line. Tokens: ${CLI_TOKENS.join(", ")}. {prompt} = the whole RAG conversation, {system} = system prompt, {question} = the current question, {tmpdir} = a throwaway working directory. Add your own flags (model, agent, \u2026) freely. Saves when you leave the field.`
+      );
+      cliSetting.settingEl.addClass("rag-cli-row");
+      const cliInput = cliSetting.controlEl.createEl("textarea", {
+        cls: "text-input rag-cli-template",
+        attr: { spellcheck: "false", rows: "4" }
+      });
+      cliInput.value = this.plugin.settings.cliTemplate;
+      cliInput.addEventListener("change", async () => {
+        this.plugin.settings.cliTemplate = cliInput.value;
+        await this.plugin.saveSettings();
+      });
+    }
+    new import_obsidian3.Setting(containerEl).setName("Test Connection").setDesc("Verify both providers: embedding round-trip, and a real chat round-trip for CLI").addButton(
       (btn) => btn.setButtonText("Test").onClick(async () => {
-        var _a2;
         btn.setButtonText("Testing...");
         btn.disabled = true;
         try {
-          const provider = createProvider(this.plugin.settings);
-          const pingResult = await provider.ping();
-          if (!pingResult.reachable) {
-            new import_obsidian3.Notice(`\u274C Provider not reachable: ${(_a2 = pingResult.errorMessage) != null ? _a2 : "connection failed"}`);
-            return;
+          const embedder = createEmbedder(
+            this.plugin.settings,
+            (0, import_path2.join)(this.app.vault.adapter.getBasePath(), this.plugin.manifest?.dir ?? ""),
+            (message) => new import_obsidian3.Notice(message, 3e3)
+          );
+          const embedPing = await embedder.ping();
+          if (!embedPing.reachable) {
+            new import_obsidian3.Notice(
+              `\u274C Embeddings: provider not reachable: ${embedPing.errorMessage ?? "connection failed"}`,
+              1e4
+            );
+          } else {
+            const embedResult = await embedder.embed(["test"]);
+            new import_obsidian3.Notice(
+              `\u2713 Embeddings: ${this.plugin.settings.embeddingModel} returns ${embedResult.dimension}-dim vectors (${embedPing.latencyMs}ms)`,
+              1e4
+            );
           }
-          const embedResult = await provider.embed(["test"]);
-          new import_obsidian3.Notice(`\u2713 Connected \u2014 ${this.plugin.settings.embeddingModel} returns ${embedResult.dimension}-dim embeddings (${pingResult.latencyMs}ms)`);
+          const chat = createChatProvider(this.plugin.settings);
+          const chatPing = await chat.ping();
+          if (!chatPing.reachable) {
+            new import_obsidian3.Notice(
+              `\u274C Chat: not reachable: ${chatPing.errorMessage ?? "connection failed"}`,
+              1e4
+            );
+          } else if (chatPing.sampleResponse !== void 0) {
+            const sample = chatPing.sampleResponse.length > 120 ? chatPing.sampleResponse.slice(0, 117) + "\u2026" : chatPing.sampleResponse;
+            new import_obsidian3.Notice(
+              `\u2713 Chat: round-trip OK in ${chatPing.latencyMs}ms \u2014 parsed reply: ${sample}`,
+              1e4
+            );
+          } else {
+            new import_obsidian3.Notice(`\u2713 Chat: provider reachable (${chatPing.latencyMs}ms)`, 1e4);
+          }
         } catch (err) {
-          new import_obsidian3.Notice(`\u274C ${err.message}`);
+          new import_obsidian3.Notice(`\u274C ${err.message}`, 1e4);
         } finally {
           btn.setButtonText("Test");
           btn.disabled = false;
@@ -514,12 +1182,6 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian3.Setting(containerEl).setName("Enable Streaming").setDesc("Stream answer tokens as they are generated").addToggle(
-      (toggle) => toggle.setValue(this.plugin.settings.streamingEnabled).onChange(async (value) => {
-        this.plugin.settings.streamingEnabled = value;
-        await this.plugin.saveSettings();
-      })
-    );
     new import_obsidian3.Setting(containerEl).setName("Auto-index on Startup").setDesc("Automatically re-index changed files when Obsidian starts").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.autoIndexOnStartup).onChange(async (value) => {
         this.plugin.settings.autoIndexOnStartup = value;
@@ -527,13 +1189,21 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
       })
     );
     containerEl.createEl("h3", { text: "Index Management" });
-    new import_obsidian3.Setting(containerEl).setName("Index Location").setDesc(`Stored at: ${(_b = (_a = this.plugin.manifest) == null ? void 0 : _a.dir) != null ? _b : ".obsidian/plugins/obsidian-rag"}/index/index.json`);
-    new import_obsidian3.Setting(containerEl).setName("Clear Index").setDesc("Delete all indexed data. You will need to re-index your documents.").addButton(
+    new import_obsidian3.Setting(containerEl).setName("Index Location").setDesc(`Stored at: ${this.plugin.manifest?.dir ?? ".obsidian/plugins/obsidian-rag"}/index/index.json`);
+    new import_obsidian3.Setting(containerEl).setName("Clear Index").setDesc("Clear indexed data, or re-index files using the current embedding settings. Unchanged files are skipped.").addButton(
       (btn) => btn.setButtonText("Clear").onClick(async () => {
-        var _a2;
         if (confirm("Clear the entire document index? This cannot be undone.")) {
-          await ((_a2 = this.plugin.vectorStore) == null ? void 0 : _a2.clear(this.plugin.settings.embeddingModel));
+          await this.plugin.vectorStore?.clear(this.plugin.settings.embeddingModel);
           new import_obsidian3.Notice('Index cleared. Run "RAG: Index all files" to re-index.');
+        }
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("Re-index").onClick(async () => {
+        btn.disabled = true;
+        try {
+          await this.plugin.indexAll();
+        } finally {
+          btn.disabled = false;
         }
       })
     );
@@ -623,8 +1293,7 @@ var VectorStore = class {
     delete this.data.files[vaultPath];
   }
   getFileMtime(vaultPath) {
-    var _a, _b;
-    return (_b = (_a = this.data.files[vaultPath]) == null ? void 0 : _a.mtime) != null ? _b : null;
+    return this.data.files[vaultPath]?.mtime ?? null;
   }
   query(queryEmbedding, topK) {
     if (this.data.chunks.length === 0) return [];
@@ -666,7 +1335,6 @@ var ChunkingService = class {
    * tokens of overlap between consecutive chunks.
    */
   chunkText(text, chunkSize, chunkOverlap) {
-    var _a;
     if (text.trim().length === 0) return [];
     const sentences = text.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 0);
     const chunks = [];
@@ -681,7 +1349,7 @@ var ChunkingService = class {
         for (const wc of wordChunks) {
           chunks.push(wc.trim());
         }
-        currentChunk = this.buildOverlapPrefix((_a = chunks[chunks.length - 1]) != null ? _a : "", chunkOverlap);
+        currentChunk = this.buildOverlapPrefix(chunks[chunks.length - 1] ?? "", chunkOverlap);
         continue;
       }
       const candidate = currentChunk.length > 0 ? currentChunk + " " + sentence : sentence;
@@ -766,9 +1434,8 @@ var UNCERTAINTY_PHRASES = [
   "unable to find",
   "not available"
 ];
-function basename(path) {
-  var _a;
-  return (_a = path.split("/").pop()) != null ? _a : path;
+function basename(path2) {
+  return path2.split("/").pop() ?? path2;
 }
 var CitationService = class {
   buildCitationSource(chunk, score) {
@@ -868,12 +1535,12 @@ var PDFIndexer = class {
     const totalPages = pdf.numPages;
     const pageTexts = [];
     for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-      if (signal == null ? void 0 : signal.aborted) throw new Error("Indexing aborted");
+      if (signal?.aborted) throw new Error("Indexing aborted");
       const page = await pdf.getPage(pageNum);
       const textContent = await page.getTextContent();
       const text = textContent.items.map((item) => "str" in item ? item.str : "").join(" ").trim();
       pageTexts.push({ page: pageNum, text });
-      onProgress == null ? void 0 : onProgress(pageNum, totalPages);
+      onProgress?.(pageNum, totalPages);
     }
     const emptyPages = pageTexts.filter((p) => p.text.length < 10).length;
     const warningScannedPdf = emptyPages / totalPages > 0.3;
@@ -1028,7 +1695,7 @@ var NoteIndexer = class {
       page: 0,
       chunkIndex: idx
     }));
-    if (signal == null ? void 0 : signal.aborted) throw new Error("Indexing aborted");
+    if (signal?.aborted) throw new Error("Indexing aborted");
     if (chunks.length > 0) {
       const embeddings = await this.embeddingService.embedBatch(chunks.map((c) => c.text));
       chunks.forEach((c, i) => {
@@ -1047,8 +1714,8 @@ var IndexManager = class {
     this.chunkingService = chunkingService;
     this.embeddingService = embeddingService;
     this.vectorStore = vectorStore;
-    this.pdfIndexer = pdfIndexer != null ? pdfIndexer : new PDFIndexer(app, chunkingService, embeddingService, vectorStore);
-    this.noteIndexer = noteIndexer != null ? noteIndexer : new NoteIndexer(app, chunkingService, embeddingService, vectorStore);
+    this.pdfIndexer = pdfIndexer ?? new PDFIndexer(app, chunkingService, embeddingService, vectorStore);
+    this.noteIndexer = noteIndexer ?? new NoteIndexer(app, chunkingService, embeddingService, vectorStore);
   }
   getFilesToIndex(scope) {
     const files = this.app.vault.getFiles();
@@ -1063,9 +1730,9 @@ var IndexManager = class {
     const result = { indexed: 0, skipped: 0, failed: 0, warnings: [] };
     let saveCounter = 0;
     for (let i = 0; i < files.length; i++) {
-      if (signal == null ? void 0 : signal.aborted) break;
+      if (signal?.aborted) break;
       const file = files[i];
-      onProgress == null ? void 0 : onProgress(i + 1, files.length, file.name);
+      onProgress?.(i + 1, files.length, file.name);
       try {
         let fileResult;
         if (file.extension === "pdf") {
@@ -1167,8 +1834,7 @@ var RagView = class extends import_obsidian5.ItemView {
     this.inputEl.focus();
   }
   async onClose() {
-    var _a;
-    (_a = this.abortController) == null ? void 0 : _a.abort();
+    this.abortController?.abort();
   }
   async handleSend() {
     const question = this.inputEl.value.trim();
@@ -1260,14 +1926,13 @@ var RagView = class extends import_obsidian5.ItemView {
    * [N] citation markers with clickable links (without closing the view).
    */
   injectCitationLinks(container, sources) {
-    var _a, _b;
     if (sources.length === 0) return;
     const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
     const textNodes = [];
     let node;
     while (node = walker.nextNode()) textNodes.push(node);
     for (const textNode of textNodes) {
-      const text = (_a = textNode.textContent) != null ? _a : "";
+      const text = textNode.textContent ?? "";
       if (!/\[\d+\]/.test(text)) continue;
       const parts = text.split(/\[(\d+)\]/);
       const frag = document.createDocumentFragment();
@@ -1291,7 +1956,7 @@ var RagView = class extends import_obsidian5.ItemView {
           }
         }
       });
-      (_b = textNode.parentNode) == null ? void 0 : _b.replaceChild(frag, textNode);
+      textNode.parentNode?.replaceChild(frag, textNode);
     }
   }
   renderSources(container, sources) {
@@ -1321,11 +1986,13 @@ var RagView = class extends import_obsidian5.ItemView {
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
   }
   getErrorMessage(err) {
-    var _a;
     if (err instanceof ProviderError) {
       switch (err.code) {
         case "CONNECTION_REFUSED":
-          return `Cannot connect to ${this.settings.baseUrl}. Is Ollama / LM Studio running?`;
+          if (this.settings.chatProvider === "cli") {
+            return "CLI command failed \u2014 check the CLI Command template in settings and use Test Connection to debug it.";
+          }
+          return `Cannot connect to ${this.settings.chatBaseUrl}. Is Ollama / LM Studio running?`;
         case "MODEL_NOT_FOUND":
           return `Model '${this.settings.chatModel}' not found \u2014 check settings.`;
         case "STREAM_ABORTED":
@@ -1335,7 +2002,7 @@ var RagView = class extends import_obsidian5.ItemView {
       }
     }
     if (err.name === "AbortError") return "";
-    return `Error: ${(_a = err.message) != null ? _a : "Unknown"}`;
+    return `Error: ${err.message ?? "Unknown"}`;
   }
 };
 
@@ -1423,15 +2090,18 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
   }
   // 5 minutes
   async onload() {
-    var _a;
     await this.loadSettings();
-    const provider = createProvider(this.settings);
-    this.vectorStore = new VectorStore((_a = this.manifest.dir) != null ? _a : "", this.app);
+    const embedder = createEmbedder(this.settings, (0, import_path3.join)(
+      this.app.vault.adapter.getBasePath(),
+      this.manifest.dir ?? ""
+    ));
+    const chatProvider = createChatProvider(this.settings);
+    this.vectorStore = new VectorStore(this.manifest.dir ?? "", this.app);
     const chunkingService = new ChunkingService();
-    const embeddingService = new EmbeddingService(provider);
+    const embeddingService = new EmbeddingService(embedder);
     const citationService = new CitationService();
     this.chatService = new ChatService(
-      provider,
+      chatProvider,
       this.vectorStore,
       embeddingService,
       citationService,
@@ -1488,9 +2158,8 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
       id: "rag-cancel-index",
       name: "Cancel indexing",
       callback: () => {
-        var _a2;
         if (this.isIndexing) {
-          (_a2 = this.indexAbortController) == null ? void 0 : _a2.abort();
+          this.indexAbortController?.abort();
           new import_obsidian6.Notice("RAG: Indexing cancelled.", 4e3);
         }
       }
@@ -1503,12 +2172,11 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
     this.addSettingTab(new RagSettingTab(this.app, this));
     this.registerEvent(
       this.app.vault.on("modify", (abstractFile) => {
-        var _a2;
         const file = abstractFile;
         if (!this.settings.autoIndexOnStartup) return;
         if (file.extension !== "pdf" && file.extension !== "md") return;
         const now = Date.now();
-        const last = (_a2 = this.fileIndexDebounce.get(file.path)) != null ? _a2 : 0;
+        const last = this.fileIndexDebounce.get(file.path) ?? 0;
         if (now - last < _RagPlugin.INDEX_DEBOUNCE_MS) return;
         this.fileIndexDebounce.set(file.path, now);
         this.indexCurrentFile(file);
@@ -1529,12 +2197,10 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
     }
   }
   onunload() {
-    var _a;
-    (_a = this.indexAbortController) == null ? void 0 : _a.abort();
+    this.indexAbortController?.abort();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_RAG_CHAT);
   }
   async indexAll() {
-    var _a;
     if (this.isIndexing) {
       new import_obsidian6.Notice("RAG: Indexing already in progress.", 3e3);
       return;
@@ -1560,7 +2226,7 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
       }
     } catch (err) {
       notice.hide();
-      const msg = (_a = err.message) != null ? _a : "";
+      const msg = err.message ?? "";
       if (msg !== "Indexing aborted") {
         new import_obsidian6.Notice(`RAG: Indexing failed \u2014 ${msg}`, 8e3);
       }
@@ -1592,7 +2258,7 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
     }
   }
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, migrateLegacySettings(await this.loadData()));
   }
   async saveSettings() {
     await this.saveData(this.settings);

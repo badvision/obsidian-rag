@@ -1,4 +1,4 @@
-import { IProvider } from '../providers/types';
+import type { IChatProvider } from '../providers/types';
 import { VectorStore } from '../store/VectorStore';
 import { EmbeddingService } from './EmbeddingService';
 import { CitationService } from './CitationService';
@@ -7,7 +7,7 @@ import { RagAnswer } from './types';
 
 export class QueryService {
   constructor(
-    private provider: IProvider,
+    private provider: IChatProvider,
     private vectorStore: VectorStore,
     private embeddingService: EmbeddingService,
     private citationService: CitationService,

@@ -80,7 +80,7 @@ describe('VectorStore', () => {
 
   test('ensureLoaded: valid index.json with correct model → data loaded', async () => {
     const validIndex = JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       embeddingModel: 'nomic-embed-text',
       embeddingDimension: 768,
       createdAt: '2024-01-01T00:00:00.000Z',
@@ -119,8 +119,7 @@ describe('VectorStore', () => {
 
   // ---- ensureLoaded: wrong schemaVersion ----
 
-  test('ensureLoaded: wrong schemaVersion → empty index, console.warn called', async () => {
-    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+  test('ensureLoaded: wrong schemaVersion → empty index, schemaUpgraded set', async () => {
 
     const badSchema = JSON.stringify({
       schemaVersion: 99,
@@ -139,16 +138,14 @@ describe('VectorStore', () => {
 
     const stats = store.getStats();
     expect(stats.chunkCount).toBe(0);
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('schema version'));
-
-    warnSpy.mockRestore();
+    expect(store.schemaUpgraded).toBe(true);
   });
 
   // ---- ensureLoaded: embedding model mismatch ----
 
   test('ensureLoaded: model mismatch → throws ProviderError DIMENSION_MISMATCH', async () => {
     const indexWithOtherModel = JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       embeddingModel: 'nomic-embed-text',
       embeddingDimension: 768,
       createdAt: '2024-01-01T00:00:00.000Z',
@@ -317,7 +314,7 @@ describe('VectorStore', () => {
     const writeCall = (app.vault.adapter.write as jest.Mock).mock.calls[0];
     const parsed = JSON.parse(writeCall[1]);
     expect(parsed.chunks).toHaveLength(1);
-    expect(parsed.schemaVersion).toBe(1);
+    expect(parsed.schemaVersion).toBe(2);
   });
 
   // ---- clear ----

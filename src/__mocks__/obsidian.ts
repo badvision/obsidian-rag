@@ -14,6 +14,10 @@ function makeMockElement(): any {
     disabled: false,
     value: '',
     className: '',
+    classes: [] as string[],
+    addClass(cls: string) {
+      this.classes.push(cls);
+    },
   };
   return el;
 }
@@ -29,6 +33,7 @@ export class Plugin {
   async saveData(_data: any): Promise<void> {}
   addCommand(command: any): any { return command; }
   addSettingTab(_tab: any): void {}
+  registerView(_type: string, _factory: any): any { return { id: _type }; }
   registerEvent(event: any): any { return event; }
 }
 
@@ -41,6 +46,17 @@ export class Modal {
   }
   open(): void {}
   close(): void {}
+  onOpen(): void {}
+  onClose(): void {}
+}
+
+export class ItemView {
+  leaf: any;
+  containerEl: any;
+  constructor(leaf: any) {
+    this.leaf = leaf;
+    this.containerEl = makeMockElement();
+  }
   onOpen(): void {}
   onClose(): void {}
 }
@@ -58,10 +74,12 @@ export class PluginSettingTab {
 }
 
 export class Setting {
-  constructor(_containerEl: HTMLElement) {}
+  controlEl: any;
+  settingEl: any;
+  constructor(_containerEl: HTMLElement) { this.controlEl = makeMockElement(); this.settingEl = makeMockElement(); }
   setName(_name: string): this { return this; }
   setDesc(_desc: string): this { return this; }
-  addText(cb: (text: any) => any): this { cb({ setValue: jest.fn().mockReturnThis(), onChange: jest.fn().mockReturnThis(), inputEl: {} }); return this; }
+  addText(cb: (text: any) => any): this { cb({ setValue: jest.fn().mockReturnThis(), setPlaceholder: jest.fn().mockReturnThis(), onChange: jest.fn().mockReturnThis(), inputEl: {} }); return this; }
   addDropdown(cb: (dd: any) => any): this { cb({ addOption: jest.fn().mockReturnThis(), setValue: jest.fn().mockReturnThis(), onChange: jest.fn().mockReturnThis() }); return this; }
   addToggle(cb: (t: any) => any): this { cb({ setValue: jest.fn().mockReturnThis(), onChange: jest.fn().mockReturnThis() }); return this; }
   addSlider(cb: (s: any) => any): this { cb({ setLimits: jest.fn().mockReturnThis(), setValue: jest.fn().mockReturnThis(), onChange: jest.fn().mockReturnThis(), setDynamicTooltip: jest.fn().mockReturnThis() }); return this; }
@@ -109,4 +127,38 @@ export interface TFile extends TAbstractFile {
 
 export function loadPdfJs(): Promise<any> {
   return Promise.resolve({});
+}
+
+export interface RequestUrlOptions {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  throw?: boolean;
+}
+
+export interface RequestUrlResponse {
+  data: string;
+  json: unknown;
+  text: string;
+  status: number;
+}
+
+/**
+ * Delegates to globalThis.fetch so tests can mock the network layer there.
+ * Mirrors Obsidian semantics: non-2xx throws unless throw:false.
+ */
+export async function requestUrl(opts: RequestUrlOptions): Promise<RequestUrlResponse> {
+  const res = await fetch(opts.url, {
+    method: opts.method ?? 'GET',
+    headers: opts.headers,
+    body: opts.body,
+  });
+  const text = await res.text();
+  let json: unknown = null;
+  try { json = JSON.parse(text); } catch { json = null; }
+  if (!res.ok && opts.throw !== false) {
+    throw new Error(`Request to ${opts.url} failed with status ${res.status}`);
+  }
+  return { data: text, json, text, status: res.status };
 }

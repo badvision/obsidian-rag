@@ -6,7 +6,7 @@ import { VectorStore } from '../store/VectorStore';
 import { PDFIndexer } from './PDFIndexer';
 import { NoteIndexer } from './NoteIndexer';
 import { IndexFileResult } from './types';
-import { RagPluginSettings } from '../settings';
+import { RagPluginSettings, DEFAULT_SETTINGS } from '../settings';
 
 function makeApp(files: TFile[] = []): App {
   return {
@@ -41,25 +41,12 @@ function makeTFile(path: string, extension: string, mtime = 1000): TFile {
 }
 
 function makeSettings(overrides: Partial<RagPluginSettings> = {}): RagPluginSettings {
-  return {
-    provider: 'ollama',
-    baseUrl: 'http://localhost:11434',
-    chatModel: 'llama3.2',
-    embeddingModel: 'nomic-embed-text',
-    topK: 5,
-    chunkSize: 500,
-    chunkOverlap: 50,
-    indexScope: 'pdfs-and-notes',
-    streamingEnabled: true,
-    autoIndexOnStartup: false,
-    indexVersion: 1,
-    embeddingDimension: 0,
-    ...overrides,
-  };
+  return { ...DEFAULT_SETTINGS, topK: 5, ...overrides };
 }
 
 function makeVectorStore(): jest.Mocked<VectorStore> {
   return {
+    ensureLoaded: jest.fn().mockResolvedValue(undefined),
     getFileMtime: jest.fn().mockReturnValue(null),
     upsertFile: jest.fn(),
     save: jest.fn().mockResolvedValue(undefined),

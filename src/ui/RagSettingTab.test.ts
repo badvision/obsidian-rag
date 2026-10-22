@@ -1,32 +1,44 @@
-import { App, Setting } from 'obsidian';
+import { App, Notice, Setting } from 'obsidian';
 import { RagSettingTab, DEFAULT_SETTINGS, RagPluginSettings } from '../settings';
-import { createProvider } from '../providers/factory';
+import { createEmbedder, createChatProvider } from '../providers/factory';
 
 jest.mock('../providers/factory');
 
-const mockCreateProvider = createProvider as jest.MockedFunction<typeof createProvider>;
+const mockCreateEmbedder = createEmbedder as jest.MockedFunction<typeof createEmbedder>;
+const mockCreateChatProvider = createChatProvider as jest.MockedFunction<typeof createChatProvider>;
 
 function makeApp(): App {
   return {
     workspace: { openLinkText: jest.fn() },
-    vault: {},
+    vault: { adapter: { getBasePath: () => '/vault' } },
   } as any;
 }
+interface MockPlugin {
+  settings: RagPluginSettings;
+  saveSettings: () => Promise<void>;
+  indexAll: () => Promise<void>;
+  manifest: { dir: string };
+  vectorStore: { clear: (model: string) => Promise<void> };
+}
 
-function makeMockPlugin(settingOverrides: Partial<RagPluginSettings> = {}) {
+function makeMockPlugin(settingOverrides: Partial<RagPluginSettings> = {}): MockPlugin {
   return {
     settings: { ...DEFAULT_SETTINGS, ...settingOverrides },
     saveSettings: jest.fn().mockResolvedValue(undefined),
+    indexAll: jest.fn().mockResolvedValue(undefined),
     manifest: { dir: '.obsidian/plugins/obsidian-rag' },
     vectorStore: { clear: jest.fn().mockResolvedValue(undefined) },
   };
 }
+
+const mockListModels = () => Promise.resolve([]);
 
 /**
  * Captures all Setting callbacks from a display() call.
  * Each entry records name + handlers for dropdowns, text fields, toggles, buttons.
  */
 interface CapturedSetting {
+  name?: string;
   onChangeText?: (value: string) => Promise<void>;
   onChangeToggle?: (value: boolean) => Promise<void>;
   onChangeDropdown?: (value: string) => Promise<void>;
@@ -36,71 +48,48 @@ interface CapturedSetting {
 function captureSettingCallbacks(tab: RagSettingTab): CapturedSetting[] {
   const captured: CapturedSetting[] = [];
 
+  const origSetName = Setting.prototype.setName;
   const origAddDropdown = Setting.prototype.addDropdown;
   const origAddText = Setting.prototype.addText;
   const origAddToggle = Setting.prototype.addToggle;
   const origAddButton = Setting.prototype.addButton;
 
-  Setting.prototype.addDropdown = function(cb: any): any {
-    const current: CapturedSetting = {};
-    captured.push(current);
-    const dd: any = {
-      addOption: () => dd,
-      setValue: () => dd,
-      onChange: (fn: (v: string) => Promise<void>) => {
-        current.onChangeDropdown = fn;
-        return dd;
-      },
-    };
-    cb(dd);
+  const names = new Map<Setting, string>();
+
+  Setting.prototype.setName = function (name: string): any {
+    names.set(this, name);
     return this;
   };
 
-  Setting.prototype.addText = function(cb: any): any {
-    const current: CapturedSetting = {};
-    captured.push(current);
-    const text: any = {
-      setValue: () => text,
-      onChange: (fn: (v: string) => Promise<void>) => {
-        current.onChangeText = fn;
-        return text;
-      },
-    };
-    cb(text);
-    return this;
+  const nameOf = (setting: Setting): string | undefined => names.get(setting);
+
+  Setting.prototype.addDropdown = function (cb: any): any {
+    const dropdown = origAddDropdown.call(this, cb);
+    cb({ addOption: jest.fn().mockReturnThis(), setValue: jest.fn().mockReturnThis(), onChange: (h: any) => { captured.push({ name: nameOf(this), onChangeDropdown: h }); return this; } } as any);
+    return dropdown;
   };
 
-  Setting.prototype.addToggle = function(cb: any): any {
-    const current: CapturedSetting = {};
-    captured.push(current);
-    const toggle: any = {
-      setValue: () => toggle,
-      onChange: (fn: (v: boolean) => Promise<void>) => {
-        current.onChangeToggle = fn;
-        return toggle;
-      },
-    };
-    cb(toggle);
-    return this;
+  Setting.prototype.addText = function (cb: any): any {
+    const text = origAddText.call(this, cb);
+    cb({ setValue: jest.fn().mockReturnThis(), setPlaceholder: jest.fn().mockReturnThis(), onChange: (h: any) => { captured.push({ name: nameOf(this), onChangeText: h }); return this; } } as any);
+    return text;
   };
 
-  Setting.prototype.addButton = function(cb: any): any {
-    const current: CapturedSetting = {};
-    captured.push(current);
-    const btn: any = {
-      setButtonText: () => btn,
-      onClick: (fn: () => Promise<void>) => {
-        current.onClickButton = fn;
-        return btn;
-      },
-      disabled: false,
-    };
-    cb(btn);
-    return this;
+  Setting.prototype.addToggle = function (cb: any): any {
+    const toggle = origAddToggle.call(this, cb);
+    cb({ setValue: jest.fn().mockReturnThis(), onChange: (h: any) => { captured.push({ name: nameOf(this), onChangeToggle: h }); return this; } } as any);
+    return toggle;
+  };
+
+  Setting.prototype.addButton = function (cb: any): any {
+    const btn = origAddButton.call(this, cb);
+    cb({ setButtonText: jest.fn().mockReturnThis(), onClick: (h: any) => { captured.push({ name: nameOf(this), onClickButton: h }); return this; } } as any);
+    return btn;
   };
 
   tab.display();
 
+  Setting.prototype.setName = origSetName;
   Setting.prototype.addDropdown = origAddDropdown;
   Setting.prototype.addText = origAddText;
   Setting.prototype.addToggle = origAddToggle;
@@ -109,9 +98,15 @@ function captureSettingCallbacks(tab: RagSettingTab): CapturedSetting[] {
   return captured;
 }
 
+function byName(captured: CapturedSetting[], name: string): CapturedSetting {
+  const found = captured.find(c => c.name === name);
+  if (!found) throw new Error(`Setting '${name}' not found`);
+  return found;
+}
+
 describe('RagSettingTab', () => {
   let mockApp: App;
-  let mockPlugin: ReturnType<typeof makeMockPlugin>;
+  let mockPlugin: MockPlugin;
   let tab: RagSettingTab;
 
   beforeEach(() => {
@@ -119,6 +114,8 @@ describe('RagSettingTab', () => {
     mockApp = makeApp();
     mockPlugin = makeMockPlugin();
     tab = new RagSettingTab(mockApp, mockPlugin);
+    mockCreateEmbedder.mockReturnValue({ listModels: mockListModels } as any);
+    mockCreateChatProvider.mockReturnValue({ listModels: mockListModels } as any);
   });
 
   test('display: renders without throwing', () => {
@@ -135,103 +132,223 @@ describe('RagSettingTab', () => {
     expect(tab.containerEl.createEl).toHaveBeenCalled();
   });
 
-  test('provider dropdown onChange with "lmstudio": updates provider and baseUrl', async () => {
+  test('embedding provider dropdown onChange with "lmstudio": updates provider and base URL', async () => {
     const settings = captureSettingCallbacks(tab);
-    const dropdowns = settings.filter(s => s.onChangeDropdown !== undefined);
-    expect(dropdowns.length).toBeGreaterThan(0);
+    const dd = byName(settings, 'Embedding Provider');
 
-    await dropdowns[0].onChangeDropdown!('lmstudio');
+    await dd.onChangeDropdown!('lmstudio');
 
-    expect(mockPlugin.settings.provider).toBe('lmstudio');
-    expect(mockPlugin.settings.baseUrl).toBe('http://localhost:1234');
+    expect(mockPlugin.settings.embeddingProvider).toBe('lmstudio');
+    expect(mockPlugin.settings.embeddingBaseUrl).toBe('http://localhost:1234');
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
   });
 
-  test('provider dropdown onChange with "ollama": updates baseUrl to 11434', async () => {
-    mockPlugin.settings.provider = 'lmstudio';
-    mockPlugin.settings.baseUrl = 'http://localhost:1234';
-
+  test('embedding provider dropdown onChange with "onnx": switches provider and resets a server model to the default ONNX model', async () => {
+    mockPlugin.settings.embeddingModel = 'nomic-embed-text';
     const settings = captureSettingCallbacks(tab);
-    const dropdowns = settings.filter(s => s.onChangeDropdown !== undefined);
+    const dd = byName(settings, 'Embedding Provider');
 
-    await dropdowns[0].onChangeDropdown!('ollama');
+    await dd.onChangeDropdown!('onnx');
 
-    expect(mockPlugin.settings.provider).toBe('ollama');
-    expect(mockPlugin.settings.baseUrl).toBe('http://localhost:11434');
+    expect(mockPlugin.settings.embeddingProvider).toBe('onnx');
+    expect(mockPlugin.settings.embeddingModel).toBe('Xenova/all-MiniLM-L6-v2');
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
   });
 
-  test('Test Connection button: calls provider.ping() and provider.embed()', async () => {
-    const mockProvider = {
-      ping: jest.fn().mockResolvedValue({ reachable: true, latencyMs: 42 }),
-      embed: jest.fn().mockResolvedValue({ embeddings: [[0.1, 0.2]], dimension: 768 }),
+  test('embedding provider dropdown onChange with "onnx": keeps an already-curated ONNX model', async () => {
+    mockPlugin.settings.embeddingModel = 'Xenova/bge-small-en-v1.5';
+    const settings = captureSettingCallbacks(tab);
+    const dd = byName(settings, 'Embedding Provider');
+
+    await dd.onChangeDropdown!('onnx');
+
+    expect(mockPlugin.settings.embeddingModel).toBe('Xenova/bge-small-en-v1.5');
+  });
+
+  test('embedding base URL is hidden and ONNX info shown when the provider is onnx', () => {
+    mockPlugin.settings.embeddingProvider = 'onnx';
+    const names = new Set<string>();
+    const origSetName = Setting.prototype.setName;
+    (Setting.prototype as any).setName = function (name: string): any {
+      names.add(name);
+      return origSetName.call(this, name);
     };
-    mockCreateProvider.mockReturnValue(mockProvider as any);
+    tab.display();
+    (Setting.prototype as any).setName = origSetName;
 
-    const settings = captureSettingCallbacks(tab);
-    const buttons = settings.filter(s => s.onClickButton !== undefined);
-    expect(buttons.length).toBeGreaterThan(0);
-
-    await buttons[0].onClickButton!();
-
-    expect(mockCreateProvider).toHaveBeenCalledWith(mockPlugin.settings);
-    expect(mockProvider.ping).toHaveBeenCalledTimes(1);
-    expect(mockProvider.embed).toHaveBeenCalledWith(['test']);
+    expect(names.has('Embedding Base URL')).toBe(false);
+    expect(names.has('ONNX Model Info')).toBe(true);
+    expect(names.has('Embedding Model')).toBe(true);
   });
 
-  test('Test Connection button: does not call embed when ping not reachable', async () => {
-    const mockProvider = {
-      ping: jest.fn().mockResolvedValue({ reachable: false, latencyMs: 0, errorMessage: 'refused' }),
+  test('ONNX device dropdown onChange: updates settings.onnxDevice and saves', async () => {
+    mockPlugin.settings.embeddingProvider = 'onnx';
+    const settings = captureSettingCallbacks(tab);
+    const dd = byName(settings, 'ONNX Device');
+
+    await dd.onChangeDropdown!('coreml');
+
+    expect(mockPlugin.settings.onnxDevice).toBe('coreml');
+    expect(mockPlugin.saveSettings).toHaveBeenCalled();
+  });
+
+  test('chat provider dropdown onChange with "cli": switches chat role only', async () => {
+    const settings = captureSettingCallbacks(tab);
+    const dd = byName(settings, 'Chat Provider');
+
+    await dd.onChangeDropdown!('cli');
+
+    expect(mockPlugin.settings.chatProvider).toBe('cli');
+    expect(mockPlugin.settings.embeddingProvider).toBe('ollama');
+    expect(mockPlugin.saveSettings).toHaveBeenCalled();
+  });
+
+  test('CLI preset dropdown onChange with "omp": fills the command template with omp flags', async () => {
+    mockPlugin.settings.chatProvider = 'cli';
+    const settings = captureSettingCallbacks(tab);
+    const dd = byName(settings, 'CLI Preset');
+
+    await dd.onChangeDropdown!('omp');
+
+    expect(mockPlugin.settings.cliPreset).toBe('omp');
+    expect(mockPlugin.settings.cliTemplate).toContain('-p');
+    expect(mockPlugin.settings.cliTemplate).toContain('{prompt}');
+    expect(mockPlugin.saveSettings).toHaveBeenCalled();
+  });
+
+  test('CLI command: rendered as a multi-line textarea, not a single-line text input', () => {
+    mockPlugin.settings.chatProvider = 'cli';
+    const settingsByName = new Map<string, any>();
+    const origSetName = Setting.prototype.setName;
+    (Setting.prototype as any).setName = function (name: string): any {
+      settingsByName.set(name, this);
+      return origSetName.call(this, name);
+    };
+    tab.display();
+    (Setting.prototype as any).setName = origSetName;
+
+    const cliSetting = settingsByName.get('CLI Command');
+    expect(cliSetting).toBeDefined();
+    const createElCalls: Array<[string, any]> = cliSetting.controlEl.createEl.mock.calls;
+    const textareaCall = createElCalls.find(([tag]) => tag === 'textarea');
+    const inputCall = createElCalls.find(([tag]) => tag === 'input');
+    expect(textareaCall).toBeDefined();
+    expect(textareaCall![1].cls).toContain('rag-cli-template');
+    expect(inputCall).toBeUndefined();
+    // The field is stacked on its own row — as a flex-row child, Obsidian's
+    // settings layout collapses a bare textarea to min-content (~1 char).
+    expect(cliSetting.settingEl.classes).toContain('rag-cli-row');
+    // The saved template is loaded into the field
+    const textareaEl = cliSetting.controlEl.createEl.mock.results.find(
+      (r: any, i: number) => createElCalls[i][0] === 'textarea'
+    )!.value;
+    expect(textareaEl.value).toBe(mockPlugin.settings.cliTemplate);
+  });
+
+  test('CLI command textarea: change event updates cliTemplate and saves', async () => {
+    mockPlugin.settings.chatProvider = 'cli';
+    const settingsByName = new Map<string, any>();
+    const origSetName = Setting.prototype.setName;
+    (Setting.prototype as any).setName = function (name: string): any {
+      settingsByName.set(name, this);
+      return origSetName.call(this, name);
+    };
+    tab.display();
+    (Setting.prototype as any).setName = origSetName;
+
+    const cliSetting = settingsByName.get('CLI Command');
+    const createElCalls: Array<[string, any]> = cliSetting.controlEl.createEl.mock.calls;
+    const idx = createElCalls.findIndex(([tag]) => tag === 'textarea');
+    const textareaEl = cliSetting.controlEl.createEl.mock.results[idx].value;
+
+    textareaEl.value = 'omp -p --mode json --no-session --model gpt5 {prompt}';
+    const changeHandler = textareaEl.addEventListener.mock.calls.find(
+      (c: any[]) => c[0] === 'change'
+    )![1];
+    await changeHandler();
+
+    expect(mockPlugin.settings.cliTemplate).toBe('omp -p --mode json --no-session --model gpt5 {prompt}');
+    expect(mockPlugin.saveSettings).toHaveBeenCalled();
+  });
+
+  test('CLI command is hidden when chat provider is not cli', () => {
+    const settings = captureSettingCallbacks(tab);
+    expect(byName(settings, 'Chat Base URL').onChangeText).toBeDefined();
+    expect(settings.some(c => c.name === 'CLI Command')).toBe(false);
+  });
+
+  test('Test Connection: pings and embeds with the embedder, pings the chat provider', async () => {
+    const mockEmbedder = {
+      ping: jest.fn().mockResolvedValue({ reachable: true, latencyMs: 10 }),
+      embed: jest.fn().mockResolvedValue({ embeddings: [[0.1, 0.2]], dimension: 2 }),
+      listModels: mockListModels,
+    };
+    const mockChat = {
+      ping: jest.fn().mockResolvedValue({ reachable: true, latencyMs: 20 }),
+      listModels: mockListModels,
+    };
+    mockCreateEmbedder.mockReturnValue(mockEmbedder as any);
+    mockCreateChatProvider.mockReturnValue(mockChat as any);
+
+    const settings = captureSettingCallbacks(tab);
+    const btn = byName(settings, 'Test Connection');
+
+    await btn.onClickButton!();
+
+    expect(mockEmbedder.ping).toHaveBeenCalledTimes(1);
+    expect(mockEmbedder.embed).toHaveBeenCalledWith(['test']);
+    expect(mockChat.ping).toHaveBeenCalledTimes(1);
+  });
+
+  test('Test Connection: surfaces the parsed CLI round-trip reply', async () => {
+    const mockEmbedder = {
+      ping: jest.fn().mockResolvedValue({ reachable: false, latencyMs: 0, errorMessage: 'down' }),
       embed: jest.fn(),
+      listModels: mockListModels,
     };
-    mockCreateProvider.mockReturnValue(mockProvider as any);
+    const mockChat = {
+      ping: jest.fn().mockResolvedValue({ reachable: true, latencyMs: 55, sampleResponse: 'PONG' }),
+      listModels: mockListModels,
+    };
+    mockCreateEmbedder.mockReturnValue(mockEmbedder as any);
+    mockCreateChatProvider.mockReturnValue(mockChat as any);
 
     const settings = captureSettingCallbacks(tab);
-    const buttons = settings.filter(s => s.onClickButton !== undefined);
+    const btn = byName(settings, 'Test Connection');
 
-    await buttons[0].onClickButton!();
+    await btn.onClickButton!();
 
-    expect(mockProvider.embed).not.toHaveBeenCalled();
+    const messages = (Notice as unknown as jest.Mock).mock.calls
+      .map((c: unknown[]) => c[0] as string);
+    expect(messages.some(m => m.includes('parsed reply: PONG'))).toBe(true);
+    expect(messages.some(m => m.includes('Embeddings: provider not reachable'))).toBe(true);
   });
 
-  test('base URL text onChange: updates settings.baseUrl and saves', async () => {
+  test('embedding base URL text onChange: updates settings.embeddingBaseUrl and saves', async () => {
     const settings = captureSettingCallbacks(tab);
-    // Text fields in display order: baseUrl(0), chatModel(1), embeddingModel(2), topK(3), chunkSize(4)
-    const texts = settings.filter(s => s.onChangeText !== undefined);
-    expect(texts.length).toBeGreaterThanOrEqual(1);
+    const text = byName(settings, 'Embedding Base URL');
 
-    await texts[0].onChangeText!('http://localhost:8080');
+    await text.onChangeText!('http://localhost:8080');
 
-    expect(mockPlugin.settings.baseUrl).toBe('http://localhost:8080');
+    expect(mockPlugin.settings.embeddingBaseUrl).toBe('http://localhost:8080');
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
   });
 
-  test('chatModel text onChange: updates settings.chatModel and saves', async () => {
+  test('chat base URL text onChange: updates settings.chatBaseUrl and saves', async () => {
     const settings = captureSettingCallbacks(tab);
-    const texts = settings.filter(s => s.onChangeText !== undefined);
+    const text = byName(settings, 'Chat Base URL');
 
-    await texts[1].onChangeText!('mistral');
+    await text.onChangeText!('http://localhost:9999');
 
-    expect(mockPlugin.settings.chatModel).toBe('mistral');
-    expect(mockPlugin.saveSettings).toHaveBeenCalled();
-  });
-
-  test('embeddingModel text onChange: updates settings.embeddingModel and saves', async () => {
-    const settings = captureSettingCallbacks(tab);
-    const texts = settings.filter(s => s.onChangeText !== undefined);
-
-    await texts[2].onChangeText!('mxbai-embed-large');
-
-    expect(mockPlugin.settings.embeddingModel).toBe('mxbai-embed-large');
+    expect(mockPlugin.settings.chatBaseUrl).toBe('http://localhost:9999');
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
   });
 
   test('streaming toggle onChange: updates settings.streamingEnabled and saves', async () => {
     const settings = captureSettingCallbacks(tab);
-    const toggles = settings.filter(s => s.onChangeToggle !== undefined);
-    expect(toggles.length).toBeGreaterThan(0);
+    const toggle = byName(settings, 'Enable Streaming');
 
-    await toggles[0].onChangeToggle!(false);
+    await toggle.onChangeToggle!(false);
 
     expect(mockPlugin.settings.streamingEnabled).toBe(false);
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
@@ -239,10 +356,9 @@ describe('RagSettingTab', () => {
 
   test('autoIndex toggle onChange: updates settings.autoIndexOnStartup and saves', async () => {
     const settings = captureSettingCallbacks(tab);
-    const toggles = settings.filter(s => s.onChangeToggle !== undefined);
-    expect(toggles.length).toBeGreaterThanOrEqual(2);
+    const toggle = byName(settings, 'Auto-index on Startup');
 
-    await toggles[1].onChangeToggle!(true);
+    await toggle.onChangeToggle!(true);
 
     expect(mockPlugin.settings.autoIndexOnStartup).toBe(true);
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
@@ -250,10 +366,9 @@ describe('RagSettingTab', () => {
 
   test('topK text onChange: updates settings.topK for valid number', async () => {
     const settings = captureSettingCallbacks(tab);
-    // Text fields: baseUrl(0), chatModel(1), embeddingModel(2), topK(3), chunkSize(4)
-    const texts = settings.filter(s => s.onChangeText !== undefined);
+    const text = byName(settings, 'Top K Results');
 
-    await texts[3].onChangeText!('10');
+    await text.onChangeText!('10');
 
     expect(mockPlugin.settings.topK).toBe(10);
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
@@ -261,10 +376,10 @@ describe('RagSettingTab', () => {
 
   test('topK text onChange: ignores invalid value (NaN), does not save', async () => {
     const settings = captureSettingCallbacks(tab);
-    const texts = settings.filter(s => s.onChangeText !== undefined);
+    const text = byName(settings, 'Top K Results');
     const originalTopK = mockPlugin.settings.topK;
 
-    await texts[3].onChangeText!('abc');
+    await text.onChangeText!('abc');
 
     expect(mockPlugin.settings.topK).toBe(originalTopK);
     expect(mockPlugin.saveSettings).not.toHaveBeenCalled();
@@ -272,9 +387,9 @@ describe('RagSettingTab', () => {
 
   test('chunkSize text onChange: updates settings.chunkSize for valid number', async () => {
     const settings = captureSettingCallbacks(tab);
-    const texts = settings.filter(s => s.onChangeText !== undefined);
+    const text = byName(settings, 'Chunk Size');
 
-    await texts[4].onChangeText!('750');
+    await text.onChangeText!('750');
 
     expect(mockPlugin.settings.chunkSize).toBe(750);
     expect(mockPlugin.saveSettings).toHaveBeenCalled();

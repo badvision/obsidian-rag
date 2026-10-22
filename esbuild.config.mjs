@@ -10,6 +10,11 @@ const context = await esbuild.context({
   external: [
     'obsidian',
     'electron',
+    'onnxruntime-node',
+    // transformers.js v4 pulls sharp's ESM entry, which breaks when bundled to
+    // CJS (import.meta.url -> createRequire(undefined)). It resolves fine at
+    // runtime from the plugin's node_modules, so keep it external.
+    '@huggingface/transformers',
     '@codemirror/autocomplete',
     '@codemirror/collab',
     '@codemirror/commands',
@@ -24,7 +29,7 @@ const context = await esbuild.context({
     ...builtins,
   ],
   format: 'cjs',
-  target: 'es2018',
+  target: 'es2020',
   logLevel: 'info',
   sourcemap: prod ? false : 'inline',
   treeShaking: true,

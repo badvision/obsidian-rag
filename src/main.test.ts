@@ -138,11 +138,11 @@ describe('RagPlugin.onload', () => {
     expect(MockVectorStore).toHaveBeenCalledTimes(1);
   });
 
-  test('registers exactly 3 commands', async () => {
+  test('registers exactly 4 commands', async () => {
     const plugin = makePlugin();
     await plugin.onload();
 
-    expect(plugin.addCommand).toHaveBeenCalledTimes(3);
+    expect(plugin.addCommand).toHaveBeenCalledTimes(4);
   });
 
   test('registers settings tab once', async () => {
@@ -349,7 +349,7 @@ describe('RagPlugin settings', () => {
     expect(plugin.settings.topK).toBe(10);
     expect(plugin.settings.chatModel).toBe('custom-model');
     // Fields not in the loaded data remain at defaults
-    expect(plugin.settings.provider).toBe(DEFAULT_SETTINGS.provider);
+    expect(plugin.settings.chatProvider).toBe(DEFAULT_SETTINGS.chatProvider);
     expect(plugin.settings.chunkSize).toBe(DEFAULT_SETTINGS.chunkSize);
   });
 

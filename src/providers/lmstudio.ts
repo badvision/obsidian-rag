@@ -1,13 +1,11 @@
 import { requestUrl } from 'obsidian';
-import { ChatMessage, EmbedResult, IProvider, PingResult, ProviderError } from './types';
+import { ChatMessage, EmbedResult, IChatProvider, IEmbedder, PingResult, ProviderError } from './types';
 import { nodeStreamPost } from './nodeHttp';
 
-export class LMStudioProvider implements IProvider {
+export class LMStudioEmbedder implements IEmbedder {
   constructor(
     private baseUrl: string,
-    private chatModel: string,
-    private embeddingModel: string,
-    private streamingEnabled: boolean
+    private embeddingModel: string
   ) {}
 
   async embed(texts: string[]): Promise<EmbedResult> {
@@ -41,6 +39,46 @@ export class LMStudioProvider implements IProvider {
       );
     }
   }
+
+  async listModels(): Promise<string[]> {
+    try {
+      const response = await requestUrl({
+        url: `${this.baseUrl}/v1/models`,
+        method: 'GET',
+        throw: false,
+      });
+      if (response.status < 200 || response.status >= 300) return [];
+      const models: Array<{ id: string }> = response.json.data ?? [];
+      return models.map(m => m.id).sort();
+    } catch {
+      return [];
+    }
+  }
+
+  async ping(): Promise<PingResult> {
+    const start = Date.now();
+    try {
+      const response = await requestUrl({
+        url: `${this.baseUrl}/v1/models`,
+        method: 'GET',
+        throw: false,
+      });
+      const latencyMs = Date.now() - start;
+      if (response.status >= 200 && response.status < 300) {
+        return { reachable: true, latencyMs };
+      }
+      return { reachable: false, latencyMs, errorMessage: `HTTP ${response.status}` };
+    } catch (err) {
+      return { reachable: false, latencyMs: 0, errorMessage: (err as Error).message };
+    }
+  }
+}
+
+export class LMStudioChatProvider implements IChatProvider {
+  constructor(
+    private baseUrl: string,
+    private chatModel: string
+  ) {}
 
   async chat(
     messages: ChatMessage[],

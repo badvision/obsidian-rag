@@ -1,13 +1,11 @@
 import { requestUrl } from 'obsidian';
-import { ChatMessage, EmbedResult, IProvider, PingResult, ProviderError } from './types';
+import { ChatMessage, EmbedResult, IChatProvider, IEmbedder, PingResult, ProviderError } from './types';
 import { nodeStreamPost } from './nodeHttp';
 
-export class OllamaProvider implements IProvider {
+export class OllamaEmbedder implements IEmbedder {
   constructor(
     private baseUrl: string,
-    private chatModel: string,
-    private embeddingModel: string,
-    private streamingEnabled: boolean
+    private embeddingModel: string
   ) {}
 
   async embed(texts: string[]): Promise<EmbedResult> {
@@ -70,6 +68,46 @@ export class OllamaProvider implements IProvider {
 
     return { embeddings, dimension: embeddings[0].length };
   }
+
+  async listModels(): Promise<string[]> {
+    try {
+      const response = await requestUrl({
+        url: `${this.baseUrl}/api/tags`,
+        method: 'GET',
+        throw: false,
+      });
+      if (response.status < 200 || response.status >= 300) return [];
+      const models: Array<{ name: string }> = response.json.models ?? [];
+      return models.map(m => m.name).sort();
+    } catch {
+      return [];
+    }
+  }
+
+  async ping(): Promise<PingResult> {
+    const start = Date.now();
+    try {
+      const response = await requestUrl({
+        url: `${this.baseUrl}/api/version`,
+        method: 'GET',
+        throw: false,
+      });
+      const latencyMs = Date.now() - start;
+      if (response.status >= 200 && response.status < 300) {
+        return { reachable: true, latencyMs };
+      }
+      return { reachable: false, latencyMs, errorMessage: `HTTP ${response.status}` };
+    } catch (err) {
+      return { reachable: false, latencyMs: 0, errorMessage: (err as Error).message };
+    }
+  }
+}
+
+export class OllamaChatProvider implements IChatProvider {
+  constructor(
+    private baseUrl: string,
+    private chatModel: string
+  ) {}
 
   async chat(
     messages: ChatMessage[],

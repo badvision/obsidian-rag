@@ -1,10 +1,11 @@
 import { EmbeddingService } from './EmbeddingService';
-import { IProvider, EmbedResult, ProviderError } from '../providers/types';
+import { EmbedResult, ProviderError } from '../providers/types';
+import type { IEmbedder } from '../providers/types';
 
-const mockProvider: IProvider = {
+const mockProvider: IEmbedder = {
   embed: jest.fn(),
-  chat: jest.fn(),
   ping: jest.fn(),
+  listModels: jest.fn(),
 };
 
 function makeEmbedResult(embeddings: number[][]): EmbedResult {

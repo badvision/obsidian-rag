@@ -2,10 +2,11 @@ import { QueryService } from './QueryService';
 import { EmbeddingService } from './EmbeddingService';
 import { CitationService } from './CitationService';
 import { VectorStore } from '../store/VectorStore';
-import { IProvider, ProviderError } from '../providers/types';
+import { ProviderError } from '../providers/types';
+import type { IChatProvider } from '../providers/types';
 import { Chunk } from '../store/types';
 import { CitationSource } from './types';
-import { RagPluginSettings } from '../settings';
+import { RagPluginSettings, DEFAULT_SETTINGS } from '../settings';
 
 const pdfChunk: Chunk = {
   id: 'papers/quantum.pdf::p3::c0',
@@ -24,36 +25,24 @@ const mockCitationSource: CitationSource = {
   displayLabel: 'quantum.pdf p.3',
 };
 
-const mockSettings: RagPluginSettings = {
-  provider: 'ollama',
-  baseUrl: 'http://localhost:11434',
-  chatModel: 'llama3.2',
-  embeddingModel: 'nomic-embed-text',
-  topK: 5,
-  chunkSize: 500,
-  chunkOverlap: 50,
-  indexScope: 'pdfs-and-notes',
-  streamingEnabled: true,
-  autoIndexOnStartup: false,
-  indexVersion: 1,
-  embeddingDimension: 0,
-};
+const mockSettings: RagPluginSettings = { ...DEFAULT_SETTINGS, topK: 5 };
 
 function makeQueryService(overrides: {
-  provider?: Partial<IProvider>;
+  provider?: Partial<IChatProvider>;
   vectorStore?: Partial<VectorStore>;
   embeddingService?: Partial<EmbeddingService>;
   citationService?: Partial<CitationService>;
   settings?: Partial<RagPluginSettings>;
 } = {}): QueryService {
   const provider = {
-    embed: jest.fn(),
     chat: jest.fn(),
     ping: jest.fn(),
+    listModels: jest.fn(),
     ...overrides.provider,
-  } as IProvider;
+  } as IChatProvider;
 
   const vectorStore = {
+    ensureLoaded: jest.fn().mockResolvedValue(undefined),
     query: jest.fn(),
     upsertFile: jest.fn(),
     removeFile: jest.fn(),
@@ -107,7 +96,6 @@ describe('QueryService.query', () => {
         assessConfidence: jest.fn().mockReturnValue('high'),
       },
       provider: {
-        embed: jest.fn(),
         chat: jest.fn().mockResolvedValue(rawAnswer),
         ping: jest.fn(),
       },
@@ -136,7 +124,6 @@ describe('QueryService.query', () => {
         query: jest.fn().mockReturnValue([]),
       },
       provider: {
-        embed: jest.fn(),
         chat: mockChat,
         ping: jest.fn(),
       },
@@ -195,7 +182,6 @@ describe('QueryService.query', () => {
         assessConfidence: jest.fn().mockReturnValue('high'),
       },
       provider: {
-        embed: jest.fn(),
         chat: mockChat,
         ping: jest.fn(),
       },
@@ -225,7 +211,6 @@ describe('QueryService.query', () => {
         assessConfidence: jest.fn().mockReturnValue('medium'),
       },
       provider: {
-        embed: jest.fn(),
         chat: jest.fn().mockResolvedValue('[1] answer'),
         ping: jest.fn(),
       },

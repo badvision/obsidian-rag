@@ -229,3 +229,31 @@
   color: var(--text-normal);
   border-color: var(--text-muted);
 }
+
+/* ── Settings: CLI command template (multi-line) ───────────────────── */
+
+.rag-cli-template {
+  font-family: var(--font-monospace) !important;
+  font-size: 0.85em !important;
+  min-height: 6.5em;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Stack the CLI command field on its own row: as a flex-row child, Obsidian's
+   settings layout collapses a bare textarea to min-content width (~1 char) —
+   the theme only sizes its own inputs, not a custom textarea. */
+.setting-item.rag-cli-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.setting-item.rag-cli-row .setting-item-control {
+  width: 100%;
+  max-width: none;
+  flex: none;
+  display: block;
+}

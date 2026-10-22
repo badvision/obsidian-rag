@@ -1,7 +1,7 @@
 {
   "name": "obsidian-rag",
-  "version": "0.1.0",
-  "description": "Local RAG search over PDFs and notes using Ollama or LM Studio",
+  "version": "0.3.2",
+  "description": "Local RAG search over PDFs and notes using Ollama, LM Studio, or a one-shot LLM CLI",
   "main": "main.js",
   "scripts": {
     "build": "node esbuild.config.mjs production",
@@ -21,6 +21,9 @@
     "typescript": "^5.4.5"
   },
   "dependencies": {
-    "jest": "^29.7.0"
+    "@huggingface/transformers": "^4.3.1",
+    "jest": "^29.7.0",
+    "onnxruntime-node": "^1.30.0",
+    "onnxruntime-web": "^1.31.0-dev.20260914-8d85527a0"
   }
 }

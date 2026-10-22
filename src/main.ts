@@ -1,6 +1,8 @@
 import { Plugin, Notice, TFile, TAbstractFile } from 'obsidian';
-import { RagPluginSettings, DEFAULT_SETTINGS, RagSettingTab } from './settings';
-import { createProvider } from './providers/factory';
+import { join } from 'path';
+import type { FileSystemAdapter } from 'obsidian';
+import { RagPluginSettings, DEFAULT_SETTINGS, RagSettingTab, migrateLegacySettings } from './settings';
+import { createEmbedder, createChatProvider } from './providers/factory';
 import { VectorStore } from './store/VectorStore';
 import { ChunkingService } from './indexer/ChunkingService';
 import { EmbeddingService } from './rag/EmbeddingService';
@@ -25,14 +27,17 @@ export default class RagPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    const provider = createProvider(this.settings);
+    const embedder = createEmbedder(this.settings, join(
+      (this.app.vault.adapter as FileSystemAdapter).getBasePath(), this.manifest.dir ?? ''
+    ));
+    const chatProvider = createChatProvider(this.settings);
     this.vectorStore = new VectorStore(this.manifest.dir ?? '', this.app);
     const chunkingService = new ChunkingService();
-    const embeddingService = new EmbeddingService(provider);
+    const embeddingService = new EmbeddingService(embedder);
     const citationService = new CitationService();
 
     this.chatService = new ChatService(
-      provider,
+      chatProvider,
       this.vectorStore,
       embeddingService,
       citationService,
@@ -148,7 +153,7 @@ export default class RagPlugin extends Plugin {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_RAG_CHAT);
   }
 
-  private async indexAll(): Promise<void> {
+  async indexAll(): Promise<void> {
     if (this.isIndexing) {
       new Notice('RAG: Indexing already in progress.', 3000);
       return;
@@ -215,7 +220,7 @@ export default class RagPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, migrateLegacySettings((await this.loadData()) as Record<string, unknown> | null));
   }
 
   async saveSettings(): Promise<void> {

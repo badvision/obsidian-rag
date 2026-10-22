@@ -1,47 +1,36 @@
-import { LMStudioProvider } from './lmstudio';
+import { LMStudioEmbedder, LMStudioChatProvider } from './lmstudio';
 import { ProviderError } from './types';
 
-// Helper to build a minimal ReadableStream from SSE lines
-function makeSseStream(lines: string[]): ReadableStream<Uint8Array> {
-  const encoder = new TextEncoder();
-  return new ReadableStream({
-    start(controller) {
-      for (const line of lines) {
-        controller.enqueue(encoder.encode(line + '\n'));
-      }
-      controller.close();
-    },
-  });
+jest.mock('./nodeHttp');
+import { nodeStreamPost } from './nodeHttp';
+
+function jsonResponse(status: number, body: unknown): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => JSON.stringify(body),
+  } as Response;
 }
 
-describe('LMStudioProvider', () => {
-  let provider: LMStudioProvider;
+const mockNodeStreamPost = nodeStreamPost as jest.MockedFunction<typeof nodeStreamPost>;
+
+describe('LMStudioEmbedder', () => {
+  let embedder: LMStudioEmbedder;
 
   beforeEach(() => {
-    provider = new LMStudioProvider(
-      'http://localhost:1234',
-      'lmstudio-community/Meta-Llama-3-8B',
-      'text-embedding-nomic-embed-text-v1.5',
-      false
-    );
-    jest.resetAllMocks();
+    embedder = new LMStudioEmbedder('http://localhost:1234', 'nomic-embed-text');
+    jest.clearAllMocks();
   });
 
-  // --- embed tests ---
-
   test('embed: happy path returns embeddings and dimension', async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        data: [{ embedding: [0.1, 0.2] }],
-      }),
-    } as Response);
+    globalThis.fetch = jest.fn().mockResolvedValue(
+      jsonResponse(200, { data: [{ embedding: [0.1, 0.2, 0.3] }] })
+    );
 
-    const result = await provider.embed(['hello']);
+    const result = await embedder.embed(['hello']);
 
-    expect(result.embeddings).toEqual([[0.1, 0.2]]);
-    expect(result.dimension).toBe(2);
+    expect(result.embeddings).toEqual([[0.1, 0.2, 0.3]]);
+    expect(result.dimension).toBe(3);
     expect(globalThis.fetch).toHaveBeenCalledWith(
       'http://localhost:1234/v1/embeddings',
       expect.objectContaining({ method: 'POST' })
@@ -49,127 +38,46 @@ describe('LMStudioProvider', () => {
   });
 
   test('embed: multiple texts returns all embeddings', async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        data: [
-          { embedding: [0.1, 0.2] },
-          { embedding: [0.3, 0.4] },
-          { embedding: [0.5, 0.6] },
-        ],
-      }),
-    } as Response);
+    globalThis.fetch = jest.fn().mockResolvedValue(
+      jsonResponse(200, { data: [{ embedding: [0.1] }, { embedding: [0.2] }] })
+    );
 
-    const result = await provider.embed(['a', 'b', 'c']);
+    const result = await embedder.embed(['hello', 'world']);
 
-    expect(result.embeddings).toHaveLength(3);
-    expect(result.embeddings[0]).toEqual([0.1, 0.2]);
-    expect(result.embeddings[2]).toEqual([0.5, 0.6]);
-    expect(result.dimension).toBe(2);
+    expect(result.embeddings).toHaveLength(2);
+    expect(result.dimension).toBe(1);
   });
 
   test('embed: CONNECTION_REFUSED when fetch throws TypeError', async () => {
-    globalThis.fetch = jest.fn().mockRejectedValue(
-      new TypeError('Failed to fetch')
-    );
+    globalThis.fetch = jest.fn().mockRejectedValue(new TypeError('Failed to fetch'));
 
-    await expect(provider.embed(['hello'])).rejects.toThrow(ProviderError);
-    await expect(provider.embed(['hello'])).rejects.toMatchObject({
+    await expect(embedder.embed(['hello'])).rejects.toThrow(ProviderError);
+    await expect(embedder.embed(['hello'])).rejects.toMatchObject({
       code: 'CONNECTION_REFUSED',
     });
   });
 
   test('embed: UNEXPECTED_RESPONSE on non-OK response', async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
-      ok: false,
-      status: 500,
-    } as Response);
+    globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse(500, { error: 'boom' }));
 
-    await expect(provider.embed(['hello'])).rejects.toThrow(ProviderError);
-    await expect(provider.embed(['hello'])).rejects.toMatchObject({
+    await expect(embedder.embed(['hello'])).rejects.toThrow(ProviderError);
+    await expect(embedder.embed(['hello'])).rejects.toMatchObject({
       code: 'UNEXPECTED_RESPONSE',
     });
   });
 
-  // --- chat tests ---
-
-  test('chat: non-streaming returns message content', async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        choices: [{ message: { content: 'answer' } }],
-      }),
-    } as Response);
-
-    const signal = new AbortController().signal;
-    const result = await provider.chat(
-      [{ role: 'user', content: 'question' }],
-      signal
+  test('listModels: returns sorted model ids from /v1/models', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValue(
+      jsonResponse(200, { data: [{ id: 'z-model' }, { id: 'a-model' }] })
     );
 
-    expect(result).toBe('answer');
+    await expect(embedder.listModels()).resolves.toEqual(['a-model', 'z-model']);
   });
-
-  test('chat: SSE streaming calls onToken and returns accumulated string', async () => {
-    provider = new LMStudioProvider(
-      'http://localhost:1234',
-      'lmstudio-community/Meta-Llama-3-8B',
-      'text-embedding-nomic-embed-text-v1.5',
-      true
-    );
-
-    const lines = [
-      'data: ' + JSON.stringify({ choices: [{ delta: { content: 'Hello' } }] }),
-      'data: ' + JSON.stringify({ choices: [{ delta: { content: ' world' } }] }),
-      'data: [DONE]',
-    ];
-
-    globalThis.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      body: makeSseStream(lines),
-    } as unknown as Response);
-
-    const tokens: string[] = [];
-    const signal = new AbortController().signal;
-    const result = await provider.chat(
-      [{ role: 'user', content: 'hi' }],
-      signal,
-      (token: string) => tokens.push(token)
-    );
-
-    expect(tokens).toEqual(['Hello', ' world']);
-    expect(result).toBe('Hello world');
-  });
-
-  test('chat: AbortError throws ProviderError with STREAM_ABORTED', async () => {
-    provider = new LMStudioProvider(
-      'http://localhost:1234',
-      'lmstudio-community/Meta-Llama-3-8B',
-      'text-embedding-nomic-embed-text-v1.5',
-      true
-    );
-
-    const abortErr = new DOMException('aborted', 'AbortError');
-    globalThis.fetch = jest.fn().mockRejectedValue(abortErr);
-
-    const signal = new AbortController().signal;
-    await expect(
-      provider.chat([{ role: 'user', content: 'hi' }], signal)
-    ).rejects.toMatchObject({ code: 'STREAM_ABORTED' });
-  });
-
-  // --- ping tests ---
 
   test('ping: reachable returns true with latency', async () => {
-    globalThis.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-    } as Response);
+    globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse(200, { data: [] }));
 
-    const result = await provider.ping();
+    const result = await embedder.ping();
 
     expect(result.reachable).toBe(true);
     expect(result.latencyMs).toEqual(expect.any(Number));
@@ -178,10 +86,83 @@ describe('LMStudioProvider', () => {
   test('ping: unreachable returns false and never throws', async () => {
     globalThis.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED'));
 
+    const result = await embedder.ping();
+
+    expect(result.reachable).toBe(false);
+    expect(result.errorMessage).toBeDefined();
+  });
+});
+
+describe('LMStudioChatProvider', () => {
+  let provider: LMStudioChatProvider;
+
+  beforeEach(() => {
+    provider = new LMStudioChatProvider('http://localhost:1234', 'llama3.2');
+    jest.clearAllMocks();
+  });
+
+  test('chat: SSE stream calls onToken per chunk and returns accumulated string', async () => {
+    const lines = [
+      'data: ' + JSON.stringify({ choices: [{ delta: { content: 'Hello' } }] }),
+      'data: ' + JSON.stringify({ choices: [{ delta: { content: ' world' } }] }),
+      'data: [DONE]',
+    ];
+    mockNodeStreamPost.mockImplementation(async (opts) => {
+      for (const line of lines) opts.onLine(line);
+    });
+
+    const tokens: string[] = [];
+    const result = await provider.chat(
+      [{ role: 'user', content: 'hi' }],
+      new AbortController().signal,
+      (token) => tokens.push(token)
+    );
+
+    expect(tokens).toEqual(['Hello', ' world']);
+    expect(result).toBe('Hello world');
+    expect(mockNodeStreamPost).toHaveBeenCalledWith(
+      expect.objectContaining({ url: 'http://localhost:1234/v1/chat/completions' })
+    );
+  });
+
+  test('chat: AbortError throws ProviderError with STREAM_ABORTED', async () => {
+    mockNodeStreamPost.mockRejectedValue(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+
+    await expect(
+      provider.chat([{ role: 'user', content: 'hi' }], new AbortController().signal)
+    ).rejects.toMatchObject({ code: 'STREAM_ABORTED' });
+  });
+
+  test('chat: connection error throws ProviderError with CONNECTION_REFUSED', async () => {
+    mockNodeStreamPost.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    await expect(
+      provider.chat([{ role: 'user', content: 'hi' }], new AbortController().signal)
+    ).rejects.toMatchObject({ code: 'CONNECTION_REFUSED' });
+  });
+
+  test('listModels: returns sorted model ids from /v1/models', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValue(
+      jsonResponse(200, { data: [{ id: 'b' }, { id: 'a' }] })
+    );
+
+    await expect(provider.listModels()).resolves.toEqual(['a', 'b']);
+  });
+
+  test('ping: reachable returns true with latency', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse(200, { data: [] }));
+
+    const result = await provider.ping();
+
+    expect(result.reachable).toBe(true);
+  });
+
+  test('ping: unreachable returns false and never throws', async () => {
+    globalThis.fetch = jest.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+
     const result = await provider.ping();
 
     expect(result.reachable).toBe(false);
-    expect(result.latencyMs).toBe(0);
     expect(result.errorMessage).toBeDefined();
   });
 });
