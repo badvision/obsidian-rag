@@ -56,6 +56,12 @@ export default class RagPlugin extends Plugin {
       (leaf) => new RagView(leaf, this.chatService, this.settings)
     );
 
+    this.addRibbonIcon(
+      'message-square',
+      'RAG: Open chat',
+      () => this.openChatView()
+    );
+
     this.vectorStore.ensureLoaded(this.settings.embeddingModel)
       .then(() => {
         if (this.vectorStore.schemaUpgraded) {

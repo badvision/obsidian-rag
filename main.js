@@ -2117,6 +2117,11 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
       VIEW_TYPE_RAG_CHAT,
       (leaf) => new RagView(leaf, this.chatService, this.settings)
     );
+    this.addRibbonIcon(
+      "message-square",
+      "RAG: Open chat",
+      () => this.openChatView()
+    );
     this.vectorStore.ensureLoaded(this.settings.embeddingModel).then(() => {
       if (this.vectorStore.schemaUpgraded) {
         new import_obsidian6.Notice(

@@ -33,6 +33,7 @@ export class Plugin {
   async saveData(_data: any): Promise<void> {}
   addCommand(command: any): any { return command; }
   addSettingTab(_tab: any): void {}
+  addRibbonIcon(_icon: string, _title: string, _cb: () => void): any { return {}; }
   registerView(_type: string, _factory: any): any { return { id: _type }; }
   registerEvent(event: any): any { return event; }
 }
