@@ -25,8 +25,12 @@ jobs:
         include:
           - os: macos-latest   # Apple Silicon arm64
             platform: darwin-arm64
+            ortPlatform: darwin
+            ortArch: arm64
           - os: windows-latest # x64 Intel
             platform: win-x64
+            ortPlatform: win32
+            ortArch: x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -60,10 +64,21 @@ jobs:
         shell: bash
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          ORT_PLATFORM: ${{ matrix.ortPlatform }}
+          ORT_ARCH: ${{ matrix.ortArch }}
         run: |
           V="${TAG#v}"
           # Dev dependencies (jest, typescript, ...) are not needed at runtime.
           npm prune --omit=dev
+          # The Node worker loads only onnxruntime-node from
+          # bin/napi-v6/<platform>/<arch>/ — the wasm backend package and the
+          # other platforms' runtimes are dead weight in this zip (verified:
+          # the feature-extraction path runs with onnxruntime-web absent).
+          rm -rf node_modules/onnxruntime-web
+          cd node_modules/onnxruntime-node/bin/napi-v6
+          find . -mindepth 1 -maxdepth 1 -type d ! -name "$ORT_PLATFORM" -exec rm -rf {} +
+          (cd "$ORT_PLATFORM" && find . -mindepth 1 -maxdepth 1 -type d ! -name "$ORT_ARCH" -exec rm -rf {} +)
+          cd - > /dev/null
           mkdir -p dist/obsidian-rag
           cp main.js manifest.json styles.css package.json package-lock.json dist/obsidian-rag/
           cp -R node_modules dist/obsidian-rag/

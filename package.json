@@ -16,6 +16,7 @@
     "@types/node": "^20.14.0",
     "builtin-modules": "^3.3.0",
     "esbuild": "^0.21.5",
+    "jest": "^29.7.0",
     "obsidian": "latest",
     "ts-jest": "^29.1.4",
     "typescript": "^5.4.5"
@@ -23,7 +24,6 @@
   "dependencies": {
     "@blackwell-systems/gcf": "^2.6.1",
     "@huggingface/transformers": "^4.3.1",
-    "jest": "^29.7.0",
     "onnxruntime-node": "^1.30.0",
     "onnxruntime-web": "^1.31.0-dev.20260914-8d85527a0"
   }
