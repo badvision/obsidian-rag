@@ -46,11 +46,12 @@ function makeSettings(overrides: Partial<RagPluginSettings> = {}): RagPluginSett
 
 function makeVectorStore(): jest.Mocked<VectorStore> {
   return {
-    ensureLoaded: jest.fn().mockResolvedValue(undefined),
+    prepareForIndexing: jest.fn().mockResolvedValue(undefined),
+    finishIndexing: jest.fn().mockResolvedValue(undefined),
     getFileMtime: jest.fn().mockReturnValue(null),
-    upsertFile: jest.fn(),
-    save: jest.fn().mockResolvedValue(undefined),
-    removeFile: jest.fn(),
+    upsertFile: jest.fn().mockResolvedValue(undefined),
+    removeFile: jest.fn().mockResolvedValue(undefined),
+    getIndexedPaths: jest.fn().mockReturnValue([]),
   } as unknown as jest.Mocked<VectorStore>;
 }
 
@@ -143,17 +144,40 @@ describe('IndexManager', () => {
     expect(onProgress).toHaveBeenNthCalledWith(2, 2, 2, 'b.md');
   });
 
-  test('indexAll: save called at every 10th file and once at end', async () => {
-    // Create 11 files: save should be called after file 10 and at the end
-    const files = Array.from({ length: 11 }, (_, i) =>
-      makeTFile(`file${i}.pdf`, 'pdf')
-    );
+  test('indexAll: one atomic publication per run (prepare + finish exactly once, no per-file saves)', async () => {
+    const files = Array.from({ length: 11 }, (_, i) => makeTFile(`file${i}.pdf`, 'pdf'));
     (app.vault.getFiles as jest.Mock).mockReturnValue(files);
 
     await indexManager.indexAll(makeSettings());
 
-    // save called at least twice: once at file 10, once at end
-    expect(vectorStore.save).toHaveBeenCalledTimes(2);
+    expect(vectorStore.prepareForIndexing).toHaveBeenCalledTimes(1);
+    expect(vectorStore.prepareForIndexing).toHaveBeenCalledWith(makeSettings().embeddingModel);
+    expect(vectorStore.finishIndexing).toHaveBeenCalledTimes(1);
+  });
+
+  test('indexAll: sweeps stale entries whose source file is gone from the vault', async () => {
+    const files = [makeTFile('kept.pdf', 'pdf')];
+    (app.vault.getFiles as jest.Mock).mockReturnValue(files);
+    vectorStore.getIndexedPaths.mockReturnValue(['kept.pdf', 'gone.pdf', 'renamed-away.md']);
+
+    await indexManager.indexAll(makeSettings());
+
+    expect(vectorStore.removeFile).toHaveBeenCalledTimes(2);
+    expect(vectorStore.removeFile).toHaveBeenCalledWith('gone.pdf');
+    expect(vectorStore.removeFile).toHaveBeenCalledWith('renamed-away.md');
+    expect(vectorStore.removeFile).not.toHaveBeenCalledWith('kept.pdf');
+  });
+
+  test('indexAll: stale sweep respects files present in the vault regardless of scope', async () => {
+    const files = [makeTFile('a.pdf', 'pdf'), makeTFile('notes/alive.md', 'md')];
+    (app.vault.getFiles as jest.Mock).mockReturnValue(files);
+    // an md entry whose note still exists must NOT be swept in pdfs-only scope
+    vectorStore.getIndexedPaths.mockReturnValue(['notes/alive.md']);
+
+    const result = await indexManager.indexAll(makeSettings({ indexScope: 'pdfs-only' }));
+
+    expect(result.indexed).toBe(1);
+    expect(vectorStore.removeFile).not.toHaveBeenCalledWith('notes/alive.md');
   });
 
   test('indexAll: per-file error → failed++ and continues to next file', async () => {
@@ -171,9 +195,10 @@ describe('IndexManager', () => {
 
     expect(result.failed).toBe(1);
     expect(result.indexed).toBe(1);
+    expect(vectorStore.finishIndexing).toHaveBeenCalledTimes(1); // partial work still published
   });
 
-  test('indexAll: abort before first file → returns 0 indexed/skipped/failed', async () => {
+  test('indexAll: abort before first file → returns 0 indexed/skipped/failed and still publishes', async () => {
     const files = [
       makeTFile('a.pdf', 'pdf'),
       makeTFile('b.pdf', 'pdf'),
@@ -188,6 +213,30 @@ describe('IndexManager', () => {
     expect(result.indexed).toBe(0);
     expect(result.skipped).toBe(0);
     expect(result.failed).toBe(0);
+    expect(vectorStore.finishIndexing).toHaveBeenCalledTimes(1); // DB left in a published state
+  });
+
+  test('indexAll: abort mid-run stops at the file boundary and publishes completed files', async () => {
+    const files = [
+      makeTFile('a.pdf', 'pdf'),
+      makeTFile('b.pdf', 'pdf'),
+    ];
+    (app.vault.getFiles as jest.Mock).mockReturnValue(files);
+
+    const controller = new AbortController();
+    mockPdfIndexer.indexFile
+      .mockResolvedValueOnce(makeIndexFileResult({ vaultPath: 'a.pdf' }))
+      .mockImplementationOnce(async (_file: unknown, _settings: unknown, _progress: unknown, signal?: AbortSignal) => {
+        if (signal?.aborted) throw new Error('Indexing aborted');
+        controller.abort(); // simulate cancel arriving during the second file
+        if (signal?.aborted) throw new Error('Indexing aborted');
+        return makeIndexFileResult({ vaultPath: 'b.pdf' });
+      });
+
+    const result = await indexManager.indexAll(makeSettings(), undefined, controller.signal);
+
+    expect(result.indexed).toBe(1); // only file a completed
+    expect(vectorStore.finishIndexing).toHaveBeenCalledTimes(1);
   });
 
   test('indexAll: skipped file increments skipped count', async () => {
@@ -233,17 +282,18 @@ describe('IndexManager', () => {
 
   // ---- indexCurrentFile ----
 
-  test('indexCurrentFile: indexes a pdf file and saves', async () => {
+  test('indexCurrentFile: indexes a pdf file with one prepare/finish run', async () => {
     const file = makeTFile('single.pdf', 'pdf');
 
     const result = await indexManager.indexCurrentFile(file, makeSettings());
 
     expect(mockPdfIndexer.indexFile).toHaveBeenCalledWith(file, makeSettings());
-    expect(vectorStore.save).toHaveBeenCalledTimes(1);
+    expect(vectorStore.prepareForIndexing).toHaveBeenCalledTimes(1);
+    expect(vectorStore.finishIndexing).toHaveBeenCalledTimes(1);
     expect(result.indexed).toBe(1);
   });
 
-  test('indexCurrentFile: indexes an md file and saves', async () => {
+  test('indexCurrentFile: indexes an md file with one prepare/finish run', async () => {
     const file = makeTFile('single.md', 'md');
     mockNoteIndexer.indexFile.mockResolvedValue(
       makeIndexFileResult({ vaultPath: 'single.md', pageCount: 0 })
@@ -252,26 +302,25 @@ describe('IndexManager', () => {
     const result = await indexManager.indexCurrentFile(file, makeSettings());
 
     expect(mockNoteIndexer.indexFile).toHaveBeenCalledWith(file, makeSettings());
-    expect(vectorStore.save).toHaveBeenCalledTimes(1);
+    expect(vectorStore.finishIndexing).toHaveBeenCalledTimes(1);
     expect(result.indexed).toBe(1);
   });
 
-  test('indexCurrentFile: error → failed=1 and still saves', async () => {
+  test('indexCurrentFile: error → failed=1 and the run is still closed (finishIndexing)', async () => {
     const file = makeTFile('bad.pdf', 'pdf');
     mockPdfIndexer.indexFile.mockRejectedValue(new Error('Read error'));
 
     const result = await indexManager.indexCurrentFile(file, makeSettings());
 
     expect(result.failed).toBe(1);
-    expect(vectorStore.save).toHaveBeenCalled();
+    expect(vectorStore.finishIndexing).toHaveBeenCalledTimes(1);
   });
 
   // ---- removeFile ----
 
-  test('removeFile: delegates to vectorStore.removeFile and calls save', async () => {
+  test('removeFile: delegates to the store (store owns the disk-backed publish)', async () => {
     await indexManager.removeFile('papers/foo.pdf');
 
     expect(vectorStore.removeFile).toHaveBeenCalledWith('papers/foo.pdf');
-    expect(vectorStore.save).toHaveBeenCalledTimes(1);
   });
 });

@@ -8,18 +8,3 @@ export interface Chunk {
   chunkIndex: number;
 }
 
-export interface FileEntry {
-  vaultPath: string;
-  mtime: number;
-  chunkIds: string[];
-}
-
-export interface VectorIndexData {
-  schemaVersion: number;
-  embeddingModel: string;
-  embeddingDimension: number;
-  createdAt: string;
-  updatedAt: string;
-  files: Record<string, FileEntry>;
-  chunks: Chunk[];
-}

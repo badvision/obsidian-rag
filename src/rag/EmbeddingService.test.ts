@@ -84,3 +84,126 @@ describe('EmbeddingService.embedQuery', () => {
     expect(result).toEqual(embedding);
   });
 });
+
+describe('EmbeddingService lifecycle (dispose / session guards)', () => {
+  function makeProviderWithDispose() {
+    return {
+      embed: jest.fn(),
+      ping: jest.fn(),
+      listModels: jest.fn(),
+      dispose: jest.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  test('dispose: single-flight — concurrent calls invoke provider.dispose once', async () => {
+    const provider = makeProviderWithDispose();
+    const service = new EmbeddingService(provider);
+
+    await Promise.all([service.dispose(), service.dispose(), service.dispose()]);
+
+    expect(provider.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  test('dispose: no-op while an embed is in flight; works once it finishes', async () => {
+    const provider = makeProviderWithDispose();
+    let releaseEmbed!: (r: EmbedResult) => void;
+    (provider.embed as jest.Mock).mockImplementation(
+      () => new Promise<EmbedResult>(resolve => { releaseEmbed = resolve; })
+    );
+    const service = new EmbeddingService(provider);
+
+    const pending = service.embedQuery('q');
+    await Promise.resolve();
+    await service.dispose();
+    expect(provider.dispose).not.toHaveBeenCalled(); // never dispose mid-inference
+
+    releaseEmbed(makeEmbedResult([[0.1]]));
+    await pending;
+    await service.dispose();
+    expect(provider.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  test('dispose: no-op while a session is held (index run keeps worker across files)', async () => {
+    const provider = makeProviderWithDispose();
+    const service = new EmbeddingService(provider);
+
+    service.beginSession();
+    await service.dispose();
+    expect(provider.dispose).not.toHaveBeenCalled();
+
+    service.endSession();
+    await service.dispose();
+    expect(provider.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  test('dispose: without provider.dispose (stateless HTTP providers) resolves as a no-op', async () => {
+    const provider = { embed: jest.fn(), ping: jest.fn(), listModels: jest.fn() };
+    const service = new EmbeddingService(provider);
+    await expect(service.dispose()).resolves.toBeUndefined();
+  });
+
+  test('dispose: a rejected provider.dispose is swallowed into the promise and re-arms', async () => {
+    const provider = makeProviderWithDispose();
+    (provider.dispose as jest.Mock)
+      .mockRejectedValueOnce(new Error('worker gone'))
+      .mockResolvedValueOnce(undefined);
+    const service = new EmbeddingService(provider);
+
+    await expect(service.dispose()).rejects.toThrow('worker gone');
+    await expect(service.dispose()).resolves.toBeUndefined();
+    expect(provider.dispose).toHaveBeenCalledTimes(2);
+  });
+
+  test('forceDispose: unload cancels a pending embed that never settles (bounded, no wait)', async () => {
+    const provider = makeProviderWithDispose();
+    let releaseEmbed!: (r: EmbedResult) => void;
+    (provider.embed as jest.Mock).mockImplementation(
+      () => new Promise<EmbedResult>(resolve => { releaseEmbed = resolve; })
+    );
+    const service = new EmbeddingService(provider);
+
+    const pending = service.embedQuery('q'); // in flight, never settles in this test
+    await Promise.resolve();
+
+    // Unload must NOT wait for the in-flight infer — the provider dispose is
+    // invoked immediately and the provider is contractually cancel-safe.
+    await service.forceDispose();
+    expect(provider.dispose).toHaveBeenCalledTimes(1);
+
+    // Re-arming after the (eventual) settle stays single-call.
+    releaseEmbed(makeEmbedResult([[0.1]]));
+    await pending;
+    await service.forceDispose();
+    expect(provider.dispose).toHaveBeenCalledTimes(2);
+  });
+
+  test('forceDispose: works while a session is held (unload mid index run)', async () => {
+    const provider = makeProviderWithDispose();
+    const service = new EmbeddingService(provider);
+
+    service.beginSession();
+    await service.dispose();
+    expect(provider.dispose).not.toHaveBeenCalled(); // session-gated no-op
+
+    await service.forceDispose();
+    expect(provider.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  test('forceDispose: reuses an in-flight normal dispose (one provider call)', async () => {
+    const provider = makeProviderWithDispose();
+    let releaseDispose!: () => void;
+    (provider.dispose as jest.Mock).mockImplementationOnce(
+      () => new Promise<void>(r => { releaseDispose = r; })
+    );
+    const service = new EmbeddingService(provider);
+
+    const a = service.dispose();
+    const b = service.forceDispose();
+    await Promise.resolve();
+    expect(provider.dispose).toHaveBeenCalledTimes(1);
+
+    releaseDispose();
+    await Promise.all([a, b]);
+    expect(provider.dispose).toHaveBeenCalledTimes(1);
+  });
+});

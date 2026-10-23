@@ -48,6 +48,12 @@ export interface IEmbedder {
   embed(texts: string[]): Promise<EmbedResult>;
   ping(): Promise<PingResult>;
   listModels(): Promise<string[]>;
+  /**
+   * Release persistent inference resources (e.g. terminate the ONNX worker
+   * process). Optional — stateless providers (HTTP) omit it. Must be
+   * idempotent and safe to call at any time.
+   */
+  dispose?(): Promise<void>;
 }
 
 /**

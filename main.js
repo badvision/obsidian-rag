@@ -1,8 +1,11 @@
 "use strict";
+var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, { get: all[name], enumerable: true });
@@ -15,7 +18,16 @@ var __copyProps = (to, from, except, desc) => {
   }
   return to;
 };
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
 
 // src/main.ts
 var main_exports = {};
@@ -24,11 +36,11 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian6 = require("obsidian");
-var import_path3 = require("path");
+var import_path4 = require("path");
 
 // src/settings.ts
 var import_obsidian3 = require("obsidian");
-var import_path2 = require("path");
+var import_path3 = require("path");
 
 // src/providers/ollama.ts
 var import_obsidian = require("obsidian");
@@ -753,8 +765,677 @@ _CliChatProvider.PROBE_TIMEOUT_MS = 6e4;
 var CliChatProvider = _CliChatProvider;
 
 // src/providers/onnx.ts
+var import_path2 = require("path");
+
+// src/providers/onnx-process.ts
 var import_path = require("path");
-var import_module = require("module");
+var import_fs = require("fs");
+var import_child_process = require("child_process");
+var TRANSFORMERS_CACHE_KEY = "transformers-cache";
+var STDERR_TAIL = 8192;
+var DISPOSE_TIMEOUT_MS = 5e3;
+var KILL_TIMEOUT_MS = 2e3;
+var READY_TIMEOUT_MS = 15e3;
+var OnnxProcessError = class extends Error {
+  constructor(message, code = null, signal = null, childDead = true) {
+    super(message);
+    this.code = code;
+    this.signal = signal;
+    this.childDead = childDead;
+    this.name = "OnnxProcessError";
+  }
+};
+var OnnxCreateCancelledError = class extends OnnxProcessError {
+  constructor() {
+    super("ONNX pipeline creation was cancelled", null, null, false);
+  }
+};
+function errorMessage(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+function buildOnnxWorkerSource() {
+  const worker = function onnxWorkerMain() {
+    "use strict";
+    let parentPort = null;
+    try {
+      const proc = process;
+      if (proc.parentPort) parentPort = proc.parentPort;
+    } catch (err) {
+      parentPort = null;
+    }
+    if (parentPort === null) {
+      try {
+        const electron = require("electron");
+        if (electron && typeof electron === "object" && electron.parentPort) {
+          parentPort = electron.parentPort;
+        }
+      } catch (err) {
+        parentPort = null;
+      }
+    }
+    const send = (msg) => {
+      if (parentPort) parentPort.postMessage(msg);
+      else if (typeof process.send === "function") process.send(msg);
+    };
+    const onMessage = (cb) => {
+      if (parentPort) parentPort.on("message", (e) => cb(e.data));
+      else process.on("message", (raw) => cb(raw));
+    };
+    const failMessage = (e) => e instanceof Error ? e.message : String(e);
+    let pipe = null;
+    let loaded = false;
+    let shuttingDown = false;
+    let inflight = 0;
+    let queue = Promise.resolve();
+    const finishIfIdle = () => {
+      if (shuttingDown && inflight === 0) {
+        send({ t: "disposed" });
+        process.exit(0);
+      }
+    };
+    const runLoad = (msg) => {
+      const tfRequire = require("module").createRequire(
+        require("path").join(msg.pluginDir, "main.js")
+      );
+      return Promise.resolve().then(() => tfRequire("@huggingface/transformers")).then((tf) => {
+        const mod = tf;
+        mod.env.cacheDir = msg.cacheDir;
+        const opts = {
+          device: msg.device,
+          dtype: msg.dtype,
+          progress_callback: (p) => {
+            const event = p;
+            if (event && event.status === "progress" && typeof event.file === "string" && event.file) {
+              const pct = typeof event.progress === "number" ? Math.round(event.progress) : 0;
+              send({
+                t: "progress",
+                message: `Downloading ${event.file} for ${msg.model}: ${pct}%`
+              });
+            }
+          }
+        };
+        if (msg.device === "cpu") opts.session_options = { enableCpuMemArena: false };
+        if (msg.subfolder !== void 0) opts.subfolder = msg.subfolder;
+        if (msg.model_file_name !== void 0) opts.model_file_name = msg.model_file_name;
+        return mod.pipeline("feature-extraction", msg.model, opts);
+      }).then((pl) => {
+        pipe = pl;
+        loaded = true;
+        send({ t: "loaded" });
+        finishIfIdle();
+      }).catch((err) => {
+        send({ t: "error", message: failMessage(err) });
+      });
+    };
+    const runInfer = (msg) => {
+      inflight += 1;
+      return Promise.resolve().then(() => {
+        if (!pipe || !loaded) throw new Error("Model not loaded");
+        return pipe(msg.text, msg.options ?? {});
+      }).then((out) => {
+        const arr = out && out.data;
+        if (!arr || typeof arr !== "object" && typeof arr !== "function") {
+          throw new Error("Pipeline returned no data");
+        }
+        const f32 = arr instanceof Float32Array ? arr : (
+          // Tensor-backed ArrayLike coming back from transformers.js.
+          Float32Array.from(arr)
+        );
+        if (parentPort) {
+          send({ t: "result", id: msg.id, data: f32 });
+        } else {
+          send({
+            t: "result",
+            id: msg.id,
+            b64: Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength).toString("base64")
+          });
+        }
+      }).catch((err) => {
+        send({ t: "error", id: msg.id, message: failMessage(err) });
+      }).then(() => {
+        inflight -= 1;
+        finishIfIdle();
+      });
+    };
+    onMessage((raw) => {
+      if (!raw || typeof raw !== "object") return;
+      const msg = raw;
+      if (msg.t === "load") {
+        queue = queue.then(() => runLoad(msg));
+      } else if (msg.t === "infer") {
+        queue = queue.then(() => runInfer(msg));
+      } else if (msg.t === "dispose") {
+        shuttingDown = true;
+        queue = queue.then(() => {
+          send({ t: "disposed" });
+          process.exit(0);
+        });
+      }
+    });
+    send({ t: "ready" });
+  };
+  return `('use strict');
+(${worker.toString()})();
+`;
+}
+async function seedModelFilesFromBrowserCache(pluginDir, model, signal) {
+  const globalWithCaches = globalThis;
+  const cachesGlobal = globalWithCaches.caches;
+  if (!cachesGlobal) return;
+  if (signal?.aborted) {
+    throw new OnnxProcessError("Model cache seeding was cancelled");
+  }
+  const cacheDir = (0, import_path.join)(pluginDir, "models");
+  let cache;
+  try {
+    cache = await cachesGlobal.open(TRANSFORMERS_CACHE_KEY);
+  } catch (err) {
+    return;
+  }
+  const prefix = `/${model}/resolve/`;
+  const keys = await cache.keys();
+  for (const key of keys) {
+    if (signal?.aborted) {
+      throw new OnnxProcessError("Model cache seeding was cancelled");
+    }
+    let rel;
+    try {
+      const url = new URL(key.url);
+      if (!url.pathname.startsWith(prefix)) continue;
+      const rest = url.pathname.slice(prefix.length);
+      const slash = rest.indexOf("/");
+      if (slash < 0) continue;
+      const revision = rest.slice(0, slash);
+      const file = rest.slice(slash + 1);
+      if (!file || file.includes("\0")) continue;
+      rel = revision === "main" ? file : `${revision}/${file}`;
+    } catch (err) {
+      continue;
+    }
+    if (rel.includes("\0") || rel.includes("..")) continue;
+    const dest = (0, import_path.join)(cacheDir, model, rel);
+    let resp;
+    try {
+      resp = await cache.match(key);
+    } catch (err) {
+      continue;
+    }
+    if (!resp) continue;
+    const expected = Number(resp.headers.get("content-length") ?? -1);
+    try {
+      if (expected >= 0 && (0, import_fs.existsSync)(dest) && (0, import_fs.statSync)(dest).size === expected) continue;
+    } catch (err) {
+    }
+    const tmp = `${dest}.part-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      (0, import_fs.mkdirSync)((0, import_path.dirname)(dest), { recursive: true });
+      await streamToFile(resp.body, tmp, signal);
+      (0, import_fs.renameSync)(tmp, dest);
+    } catch (err) {
+      try {
+        if ((0, import_fs.existsSync)(tmp)) (0, import_fs.unlinkSync)(tmp);
+      } catch (cleanupErr) {
+      }
+      throw new OnnxProcessError(
+        `Failed to seed cached model file '${rel}' for '${model}': ${errorMessage(err)}`
+      );
+    }
+  }
+}
+async function streamToFile(body, dest, signal) {
+  await new Promise((resolve, reject) => {
+    const out = (0, import_fs.createWriteStream)(dest);
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      out.destroy();
+      reject(err);
+    };
+    out.on("error", fail);
+    out.on("finish", () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    });
+    if (!body) {
+      out.end();
+      return;
+    }
+    const reader = body.getReader();
+    const pump = async () => {
+      try {
+        for (; ; ) {
+          if (signal?.aborted) {
+            throw new OnnxProcessError("Model cache seeding was cancelled");
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!out.write(value)) {
+            await new Promise((r) => {
+              out.once("drain", () => r());
+              out.once("error", () => r());
+            });
+          }
+        }
+        out.end();
+      } catch (err) {
+        fail(err);
+      } finally {
+        reader.cancel().catch(() => {
+        });
+        reader.releaseLock();
+      }
+    };
+    void pump();
+  });
+}
+function writeWorkerFile(cacheDir, source) {
+  (0, import_fs.mkdirSync)(cacheDir, { recursive: true });
+  const name = `.onnx-worker-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.cjs`;
+  const workerPath = (0, import_path.join)(cacheDir, name);
+  (0, import_fs.writeFileSync)(workerPath, source, "utf8");
+  return workerPath;
+}
+function resolveUtilityProcess() {
+  try {
+    const electron = require("electron");
+    const up = electron?.remote?.require?.("electron")?.utilityProcess;
+    if (up) return up;
+  } catch (err) {
+  }
+  try {
+    const remote = require("@electron/remote");
+    const up = remote?.require?.("electron")?.utilityProcess ?? remote?.utilityProcess;
+    if (up) return up;
+  } catch (err) {
+  }
+  return null;
+}
+function spawnWorker(workerPath) {
+  if (process.versions.electron) {
+    const up = resolveUtilityProcess();
+    if (!up) {
+      throw new OnnxProcessError(
+        'Cannot isolate ONNX inference: Electron utilityProcess is unavailable (require("electron").remote). A child process is required; refusing to run ONNX in the renderer.'
+      );
+    }
+    return up.fork(workerPath, [], {
+      stdio: "pipe",
+      serviceName: "Obsidian RAG embeddings",
+      allowLoadingUnsignedLibraries: true
+    });
+  }
+  const child = (0, import_child_process.fork)(workerPath, [], {
+    stdio: ["pipe", "pipe", "pipe", "ipc"]
+  });
+  return {
+    postMessage: (msg) => {
+      child.send(msg);
+    },
+    on: (type, cb) => child.on(type, cb),
+    stdout: child.stdout,
+    stderr: child.stderr,
+    kill: (signal) => child.kill(signal),
+    removeAllListeners: () => child.removeAllListeners(),
+    get pid() {
+      return child.pid;
+    }
+  };
+}
+var ProcessPipelineHost = class {
+  constructor(onProgress) {
+    this.child = null;
+    this.workerPath = null;
+    this.disposed = false;
+    this.dead = false;
+    this.exitInfo = null;
+    this.stderrTail = "";
+    this.nextId = 1;
+    this.pending = /* @__PURE__ */ new Map();
+    this.readySettled = false;
+    this.loadSettled = false;
+    this.readyResolve = null;
+    this.readyReject = null;
+    this.loadResolve = null;
+    this.loadReject = null;
+    this.exitWaiters = [];
+    this.readyPromise = null;
+    this.loadPromise = null;
+    this.onProgress = onProgress ?? null;
+  }
+  /** Live child pid. For utilityProcess it is undefined until 'spawn'. */
+  get pid() {
+    return this.child ? this.child.pid : void 0;
+  }
+  /**
+   * Resolves when the child signals ready (bootstrap + IPC handshake only —
+   * no model work). Rejects if the child dies or fails to start.
+   */
+  waitForReady() {
+    if (!this.readyPromise) {
+      this.readyPromise = new Promise((resolve, reject) => {
+        this.readyResolve = resolve;
+        this.readyReject = reject;
+      });
+    }
+    return this.readyPromise;
+  }
+  /**
+   * Resolves when the model is loaded in the child. Deliberately no hard
+   * timeout: first-use downloads and session creation can legitimately run
+   * for a long time. Rejects only on child death or a reported load error.
+   */
+  waitForLoad() {
+    if (!this.loadPromise) {
+      this.loadPromise = new Promise((resolve, reject) => {
+        this.loadResolve = resolve;
+        this.loadReject = reject;
+      });
+    }
+    return this.loadPromise;
+  }
+  attach(child, workerPath) {
+    this.child = child;
+    this.workerPath = workerPath;
+    child.on("message", (raw) => {
+      this.handleMessage(raw);
+    });
+    child.on("exit", (code, signal) => this.onExit(toNullableNumber(code), toSignal(signal)));
+    child.on("error", (first, ...rest) => {
+      const detail = first instanceof Error ? first.message : [first, ...rest].map(String).filter(Boolean).join(" | ");
+      this.fail(new OnnxProcessError(`Embedding child process error: ${detail || "unknown"}`));
+    });
+    child.stdout?.on("data", () => {
+    });
+    child.stderr?.on("data", (chunk) => this.tail(chunk));
+  }
+  infer(text, options) {
+    if (this.disposed) {
+      return Promise.reject(new OnnxProcessError("Embedding pipeline has been disposed"));
+    }
+    if (this.dead) {
+      return Promise.reject(
+        new OnnxProcessError(
+          `Embedding child process is not running (code=${this.exitInfo?.code ?? "null"}, signal=${this.exitInfo?.signal ?? "null"})`,
+          this.exitInfo?.code ?? null,
+          this.exitInfo?.signal ?? null
+        )
+      );
+    }
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      try {
+        this.child.postMessage({ t: "infer", id, text, options: options ?? {} });
+      } catch (err) {
+        this.pending.delete(id);
+        reject(new OnnxProcessError(`Failed to send inference request: ${errorMessage(err)}`));
+      }
+    });
+  }
+  async dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    const child = this.child;
+    if (!child || this.dead) {
+      this.dead = true;
+      this.cleanup();
+      return;
+    }
+    try {
+      child.postMessage({ t: "dispose" });
+    } catch (err) {
+    }
+    await Promise.race([this.waitForExit(), delay(DISPOSE_TIMEOUT_MS)]);
+    if (!this.dead) {
+      const pid = child.pid;
+      if (typeof pid === "number") {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (err) {
+        }
+      }
+      try {
+        child.kill("SIGKILL");
+      } catch (err) {
+      }
+      await Promise.race([this.waitForExit(), delay(KILL_TIMEOUT_MS)]);
+    }
+    this.dead = true;
+    this.cleanup();
+  }
+  /** Reject ready/load and every pending infer (first failure wins). */
+  fail(err) {
+    if (!this.readySettled) {
+      this.readySettled = true;
+      this.readyReject?.(err);
+    }
+    if (!this.loadSettled) {
+      this.loadSettled = true;
+      this.loadReject?.(err);
+    }
+    for (const [id, p] of this.pending) {
+      this.pending.delete(id);
+      p.reject(err);
+    }
+  }
+  onExit(code, signal) {
+    this.exitInfo = { code, signal };
+    if (!this.disposed && (code !== 0 || signal !== null)) {
+      const tail = this.stderrTail.trim();
+      this.fail(
+        new OnnxProcessError(
+          `Embedding child process exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"})${tail ? `. Last stderr: ${tail}` : ""}`,
+          code,
+          signal
+        )
+      );
+    }
+    this.removeWorkerFile();
+    this.dead = true;
+    this.child = null;
+    for (const waiter of this.exitWaiters.splice(0)) waiter();
+  }
+  handleMessage(raw) {
+    if (!raw || typeof raw !== "object") return;
+    const msg = raw;
+    if (msg.t === "ready") {
+      if (!this.readySettled) {
+        this.readySettled = true;
+        this.readyResolve?.();
+      }
+    } else if (msg.t === "loaded") {
+      if (!this.loadSettled) {
+        this.loadSettled = true;
+        this.loadResolve?.();
+      }
+    } else if (msg.t === "progress") {
+      if (typeof msg.message === "string") this.onProgress?.(msg.message);
+    } else if (msg.t === "result") {
+      const id = msg.id;
+      if (typeof id !== "number") return;
+      const p = this.pending.get(id);
+      if (!p) return;
+      this.pending.delete(id);
+      p.resolve({ data: decodeVector(msg) });
+    } else if (msg.t === "error") {
+      const message = typeof msg.message === "string" ? msg.message : "unknown child error";
+      const id = msg.id;
+      if (typeof id === "number") {
+        const p = this.pending.get(id);
+        if (p) {
+          this.pending.delete(id);
+          p.reject(new OnnxProcessError(message, null, null, false));
+        }
+      } else if (!this.loadSettled) {
+        this.loadSettled = true;
+        this.loadReject?.(new OnnxProcessError(message));
+      }
+    } else if (msg.t === "disposed") {
+      this.dead = true;
+    }
+  }
+  tail(chunk) {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL);
+  }
+  waitForExit() {
+    if (this.dead) return Promise.resolve();
+    return new Promise((resolve) => this.exitWaiters.push(resolve));
+  }
+  /** Remove the worker script; idempotent. Called on every child exit. */
+  removeWorkerFile() {
+    if (!this.workerPath) return;
+    const workerPath = this.workerPath;
+    this.workerPath = null;
+    try {
+      if ((0, import_fs.existsSync)(workerPath)) (0, import_fs.unlinkSync)(workerPath);
+    } catch (err) {
+    }
+  }
+  cleanup() {
+    try {
+      this.child?.removeAllListeners?.();
+    } catch (err) {
+    }
+    this.child = null;
+    this.removeWorkerFile();
+    for (const [, p] of this.pending) {
+      p.reject(new OnnxProcessError("Embedding pipeline disposed before the request completed"));
+    }
+    this.pending.clear();
+  }
+};
+function toNullableNumber(v) {
+  return v === null || v === void 0 ? null : Number(v);
+}
+function toSignal(v) {
+  return typeof v === "string" ? v : null;
+}
+function decodeVector(msg) {
+  const { data, b64 } = msg;
+  if (data instanceof Float32Array) return data;
+  if (typeof b64 === "string") {
+    const buf = Buffer.from(b64, "base64");
+    return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength >> 2);
+  }
+  if (!data) {
+    throw new OnnxProcessError("Malformed inference result from child process");
+  }
+  return Float32Array.from(data);
+}
+function delay(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer === "object" && timer !== null) {
+      const nodeTimer = timer;
+      nodeTimer.unref?.();
+    }
+  });
+}
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new OnnxProcessError(message)), ms);
+    if (typeof timer === "object" && timer !== null) {
+      const nodeTimer = timer;
+      nodeTimer.unref?.();
+    }
+    promise.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+function aborted(signal) {
+  return new Promise((_, reject) => {
+    if (!signal) return;
+    const fail = () => reject(new OnnxCreateCancelledError());
+    if (signal.aborted) {
+      queueMicrotask(fail);
+      return;
+    }
+    signal.addEventListener("abort", fail, { once: true });
+  });
+}
+function raceAbort(promise, signal) {
+  if (!signal) return promise;
+  return Promise.race([promise, aborted(signal)]);
+}
+async function createOnnxProcessPipeline(opts) {
+  if (!opts.pluginDir) {
+    throw new OnnxProcessError(
+      "pluginDir is required to locate the model cache and worker dependencies"
+    );
+  }
+  const cacheDir = (0, import_path.join)(opts.pluginDir, "models");
+  if (opts.signal?.aborted) {
+    throw new OnnxCreateCancelledError();
+  }
+  await seedModelFilesFromBrowserCache(opts.pluginDir, opts.model, opts.signal);
+  let workerPath;
+  try {
+    workerPath = writeWorkerFile(cacheDir, opts.workerSource ?? buildOnnxWorkerSource());
+  } catch (err) {
+    throw new OnnxProcessError(
+      `Failed to write ONNX worker script: ${errorMessage(err)}`
+    );
+  }
+  let spawned;
+  try {
+    spawned = spawnWorker(workerPath);
+  } catch (err) {
+    try {
+      (0, import_fs.unlinkSync)(workerPath);
+    } catch (cleanupErr) {
+    }
+    throw err instanceof OnnxProcessError ? err : new OnnxProcessError(
+      `Failed to start embedding child process: ${errorMessage(err)}`
+    );
+  }
+  const host = new ProcessPipelineHost(opts.onProgress);
+  host.attach(spawned, workerPath);
+  try {
+    await raceAbort(
+      withTimeout(host.waitForReady(), READY_TIMEOUT_MS, "Embedding child process did not become ready"),
+      opts.signal
+    );
+    const loadMsg = {
+      t: "load",
+      pluginDir: opts.pluginDir,
+      cacheDir,
+      model: opts.model,
+      device: opts.device,
+      dtype: opts.dtype
+    };
+    if (opts.subfolder !== void 0) loadMsg.subfolder = opts.subfolder;
+    if (opts.model_file_name !== void 0) loadMsg.model_file_name = opts.model_file_name;
+    spawned.postMessage(loadMsg);
+    await raceAbort(host.waitForLoad(), opts.signal);
+  } catch (err) {
+    await host.dispose().catch(() => {
+    });
+    throw err instanceof OnnxProcessError ? err : new OnnxProcessError(
+      `Failed to load ONNX model in child process: ${errorMessage(err)}`
+    );
+  }
+  const callable = (text, options) => host.infer(text, options);
+  return Object.assign(callable, {
+    dispose: () => host.dispose(),
+    // Read live: a utilityProcess pid is only set after the 'spawn' event.
+    get pid() {
+      return host.pid;
+    }
+  });
+}
+
+// src/providers/onnx.ts
 var ONNX_MODELS = {
   "Xenova/all-MiniLM-L6-v2": { label: "all-MiniLM-L6-v2 (384d, fast, English)", dimension: 384 },
   "Xenova/all-mpnet-base-v2": { label: "all-mpnet-base-v2 (768d, strong, English)", dimension: 768 },
@@ -771,44 +1452,86 @@ var OnnxEmbedder = class {
   constructor(options) {
     this.options = options;
     this.pipePromise = null;
-  }
-  defaultLoader() {
-    return async () => {
-      const requireFromPlugin = (0, import_module.createRequire)((0, import_path.join)(this.options.pluginDir, "main.js"));
-      const tf = requireFromPlugin("@huggingface/transformers");
-      tf.env.cacheDir = (0, import_path.join)(this.options.pluginDir, "models");
-      return tf;
-    };
+    this.processPipe = null;
+    /** Cancels the in-flight pipeline creation (bounded) when dispose() runs. */
+    this.creationController = null;
+    /**
+     * Monotonic generation. Each load captures it; only the current generation
+     * may install `processPipe`, so a load that settles after a dispose (or a
+     * newer load) cannot orphan a child or steal ownership of a live one.
+     */
+    this.generation = 0;
   }
   loadPipeline() {
     if (!this.pipePromise) {
-      this.pipePromise = this.load().then((pipe) => {
+      const gen = this.generation;
+      const controller = new AbortController();
+      this.creationController = controller;
+      const promise = this.load(controller.signal, gen).then((pipe) => {
         this.options.onProgress?.(`Embedding model ready (${this.options.model})`);
         return pipe;
       }).catch((err) => {
-        this.pipePromise = null;
+        if (this.pipePromise === promise) {
+          this.pipePromise = null;
+          this.processPipe = null;
+        }
         throw err;
       });
+      this.pipePromise = promise;
     }
     return this.pipePromise;
   }
-  async load() {
-    let tf;
-    try {
-      tf = await (this.options.loader ?? this.defaultLoader())();
-    } catch (err) {
-      throw this.wrapLoadError(err);
-    }
+  async load(signal, gen) {
     const load = ONNX_MODELS[this.options.model]?.load;
     const dtypes = load?.dtype ? [load.dtype] : ["q8", "fp32"];
     const preferred = this.options.device ?? "cpu";
     const devices = preferred === "coreml" ? ["coreml", "cpu"] : ["cpu"];
+    const fileOpts = this.fileOptions();
+    if (this.options.loader) {
+      let tf;
+      try {
+        tf = await this.options.loader();
+        tf.env.cacheDir = (0, import_path2.join)(this.options.pluginDir, "models");
+      } catch (err) {
+        throw this.wrapLoadError(err);
+      }
+      let lastErr2 = null;
+      for (const device of devices) {
+        for (const dtype of dtypes) {
+          try {
+            return await this.buildPipeline(tf, { device, dtype, ...fileOpts });
+          } catch (err) {
+            lastErr2 = err;
+            this.options.onProgress?.(
+              `ONNX load failed (${device}/${dtype}), trying next variant: ${err.message}`
+            );
+          }
+        }
+      }
+      throw this.wrapLoadError(lastErr2);
+    }
     let lastErr = null;
     for (const device of devices) {
       for (const dtype of dtypes) {
         try {
-          return await this.createPipeline(tf, { device, dtype, ...this.fileOptions() });
+          const pipe = await createOnnxProcessPipeline({
+            pluginDir: this.options.pluginDir,
+            model: this.options.model,
+            device,
+            dtype,
+            ...fileOpts,
+            onProgress: this.options.onProgress,
+            signal
+          });
+          if (gen === this.generation) {
+            this.processPipe = pipe;
+          } else {
+            await pipe.dispose().catch(() => {
+            });
+          }
+          return pipe;
         } catch (err) {
+          if (err instanceof OnnxCreateCancelledError) throw err;
           lastErr = err;
           this.options.onProgress?.(
             `ONNX load failed (${device}/${dtype}), trying next variant: ${err.message}`
@@ -823,7 +1546,7 @@ var OnnxEmbedder = class {
     const load = ONNX_MODELS[this.options.model]?.load;
     return load?.subfolder !== void 0 || load?.model_file_name !== void 0 ? { subfolder: load?.subfolder, model_file_name: load?.model_file_name } : {};
   }
-  async createPipeline(tf, opts) {
+  async buildPipeline(tf, opts) {
     const progress = this.options.onProgress;
     return await tf.pipeline("feature-extraction", this.options.model, {
       ...opts,
@@ -846,13 +1569,26 @@ var OnnxEmbedder = class {
     );
   }
   async embed(texts) {
-    const pipe = await this.loadPipeline();
+    const gen = this.generation;
+    let pipe;
+    try {
+      pipe = await this.loadPipeline();
+    } catch (err) {
+      if (err instanceof OnnxCreateCancelledError) {
+        throw new ProviderError("Embedding model load was cancelled", "STREAM_ABORTED", err);
+      }
+      throw err;
+    }
     const embeddings = [];
     for (const text of texts) {
       let out;
       try {
         out = await pipe(text, { pooling: "mean", normalize: true });
       } catch (err) {
+        if (err instanceof OnnxProcessError && err.childDead && gen === this.generation) {
+          this.pipePromise = null;
+          this.processPipe = null;
+        }
         throw new ProviderError(
           `ONNX inference failed: ${err.message ?? String(err)}`,
           "UNEXPECTED_RESPONSE",
@@ -862,6 +1598,31 @@ var OnnxEmbedder = class {
       embeddings.push(Array.from(out.data));
     }
     return { embeddings, dimension: embeddings[0].length };
+  }
+  /**
+   * Release the embedding pipeline: terminates the isolated child process and
+   * frees the loaded model. Idempotent; a later embed()/ping() starts a fresh
+   * pipeline.
+   */
+  async dispose() {
+    this.generation += 1;
+    const controller = this.creationController;
+    this.creationController = null;
+    const inFlight = this.pipePromise;
+    this.pipePromise = null;
+    const pipe = this.processPipe;
+    this.processPipe = null;
+    controller?.abort();
+    if (pipe) {
+      try {
+        await pipe.dispose();
+      } catch (err) {
+      }
+    }
+    if (inFlight) {
+      await Promise.race([inFlight, delayMs(8e3)]).catch(() => {
+      });
+    }
   }
   /**
    * Full round-trip: loads (and on first run downloads) the model, then embeds
@@ -888,6 +1649,14 @@ var OnnxEmbedder = class {
     return Object.keys(ONNX_MODELS);
   }
 };
+function delayMs(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer === "object" && timer !== null) {
+      timer.unref?.();
+    }
+  });
+}
 
 // src/providers/factory.ts
 function createEmbedder(settings, pluginDir, onProgress) {
@@ -962,6 +1731,7 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this.statusTimer = null;
   }
   addModelDropdown(containerEl, name, desc, provider, getValue, setValue) {
     const setting = new import_obsidian3.Setting(containerEl).setName(name).setDesc(desc);
@@ -994,15 +1764,22 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
     }).catch(() => {
       select.empty();
       select.createEl("option", { text: getValue(), value: getValue() }).selected = true;
+    }).finally(() => {
+      void provider.dispose?.().catch(() => {
+      });
     });
   }
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    if (this.statusTimer !== null) {
+      window.clearInterval(this.statusTimer);
+      this.statusTimer = null;
+    }
     containerEl.createEl("h2", { text: "RAG Plugin Settings" });
     containerEl.createEl("h3", { text: "Embeddings" });
     new import_obsidian3.Setting(containerEl).setName("Embedding Provider").setDesc("Provider used to build the semantic index").addDropdown(
-      (dd) => dd.addOption("ollama", "Ollama").addOption("lmstudio", "LM Studio / MLX").addOption("onnx", "Self-hosted ONNX (in-process, no server)").setValue(this.plugin.settings.embeddingProvider).onChange(async (value) => {
+      (dd) => dd.addOption("ollama", "Ollama").addOption("lmstudio", "LM Studio / MLX").addOption("onnx", "Managed local ONNX worker (no server)").setValue(this.plugin.settings.embeddingProvider).onChange(async (value) => {
         this.plugin.settings.embeddingProvider = value;
         this.plugin.settings.embeddingBaseUrl = EMBEDDER_DEFAULT_URL[value];
         if (value === "onnx" && !ONNX_MODELS[this.plugin.settings.embeddingModel]) {
@@ -1024,7 +1801,7 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
       containerEl,
       "Embedding Model",
       "Model for embeddings \u2014 changing this requires a full re-index",
-      createEmbedder(this.plugin.settings, (0, import_path2.join)(
+      createEmbedder(this.plugin.settings, (0, import_path3.join)(
         this.app.vault.adapter.getBasePath(),
         this.plugin.manifest?.dir ?? ""
       )),
@@ -1036,12 +1813,12 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
     );
     if (this.plugin.settings.embeddingProvider === "onnx") {
       new import_obsidian3.Setting(containerEl).setName("ONNX Model Info").setDesc(
-        `Model downloads on first use (~20-130 MB) and is cached at ${this.plugin.manifest?.dir ?? ".obsidian/plugins/obsidian-rag"}/models/. No server or network needed afterwards. Runs inside Obsidian \u2014 first use of a model takes a few seconds.`
+        `Model downloads on first use (~20-150 MB) and is cached at ${this.plugin.manifest?.dir ?? ".obsidian/plugins/obsidian-rag"}/models/. No server or network needed afterwards. Inference runs in a managed local worker \u2014 first use of a model takes a few seconds.`
       );
       new import_obsidian3.Setting(containerEl).setName("ONNX Device").setDesc(
-        "Where inference runs. CoreML uses Apple Silicon (GPU/ANE) and is much faster; if a model is unsupported there it automatically falls back to CPU."
+        "Where inference runs. CoreML uses Apple Silicon (GPU/ANE) where available; if a model is unsupported there it automatically falls back to CPU."
       ).addDropdown(
-        (dd) => dd.addOption("cpu", "CPU (safe, portable)").addOption("coreml", "CoreML \u2014 Apple GPU/ANE (faster)").setValue(this.plugin.settings.onnxDevice).onChange(async (value) => {
+        (dd) => dd.addOption("cpu", "CPU (safe, portable)").addOption("coreml", "CoreML \u2014 Apple GPU/ANE").setValue(this.plugin.settings.onnxDevice).onChange(async (value) => {
           this.plugin.settings.onnxDevice = value;
           await this.plugin.saveSettings();
         })
@@ -1114,10 +1891,11 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
       (btn) => btn.setButtonText("Test").onClick(async () => {
         btn.setButtonText("Testing...");
         btn.disabled = true;
+        let embedder = null;
         try {
-          const embedder = createEmbedder(
+          embedder = createEmbedder(
             this.plugin.settings,
-            (0, import_path2.join)(this.app.vault.adapter.getBasePath(), this.plugin.manifest?.dir ?? ""),
+            (0, import_path3.join)(this.app.vault.adapter.getBasePath(), this.plugin.manifest?.dir ?? ""),
             (message) => new import_obsidian3.Notice(message, 3e3)
           );
           const embedPing = await embedder.ping();
@@ -1152,6 +1930,8 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
         } catch (err) {
           new import_obsidian3.Notice(`\u274C ${err.message}`, 1e4);
         } finally {
+          void embedder?.dispose?.().catch(() => {
+          });
           btn.setButtonText("Test");
           btn.disabled = false;
         }
@@ -1189,12 +1969,14 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
       })
     );
     containerEl.createEl("h3", { text: "Index Management" });
-    new import_obsidian3.Setting(containerEl).setName("Index Location").setDesc(`Stored at: ${this.plugin.manifest?.dir ?? ".obsidian/plugins/obsidian-rag"}/index/index.json`);
-    new import_obsidian3.Setting(containerEl).setName("Clear Index").setDesc("Clear indexed data, or re-index files using the current embedding settings. Unchanged files are skipped.").addButton(
+    new import_obsidian3.Setting(containerEl).setName("Index Location").setDesc(`Stored at: ${this.plugin.manifest?.dir ?? ".obsidian/plugins/obsidian-rag"}/index/index.gcf`);
+    const statusSetting = new import_obsidian3.Setting(containerEl).setName("Index Status").setDesc("");
+    statusSetting.addButton(
       (btn) => btn.setButtonText("Clear").onClick(async () => {
         if (confirm("Clear the entire document index? This cannot be undone.")) {
-          await this.plugin.vectorStore?.clear(this.plugin.settings.embeddingModel);
+          await this.plugin.clearIndex();
           new import_obsidian3.Notice('Index cleared. Run "RAG: Index all files" to re-index.');
+          void this.refreshIndexStatus(statusSetting);
         }
       })
     ).addButton(
@@ -1205,16 +1987,2051 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
         } finally {
           btn.disabled = false;
         }
+        void this.refreshIndexStatus(statusSetting);
       })
     );
+    this.refreshIndexStatus(statusSetting);
+  }
+  /**
+   * Render the live index status into the "Index Status" row: in-flight run,
+   * then queued work, then the last published index (counts + when). The
+   * counts come from a bounded disk peek (header scalars + summary trailer)
+   * — the query DB is never loaded for this. Refreshes on an interval while
+   * the tab is open because an index pass can take minutes.
+   */
+  async refreshIndexStatus(statusSetting) {
+    let summary;
+    try {
+      summary = await this.indexStatusSummary();
+    } catch (err) {
+      summary = `Index status unavailable \u2014 ${err.message ?? "unknown error"}`;
+    }
+    statusSetting.descEl?.setText(summary);
+    if (typeof window === "undefined") return;
+    if (this.statusTimer) window.clearInterval(this.statusTimer);
+    this.statusTimer = window.setInterval(
+      () => {
+        void this.refreshIndexStatus(statusSetting);
+      },
+      5e3
+    );
+  }
+  /** Current status text for the "Index Status" row (see refreshIndexStatus). */
+  async indexStatusSummary() {
+    const status = this.plugin.indexScheduler.getStatus();
+    if (status.indexing) return "Indexing in progress\u2026";
+    const queued = [];
+    if (status.queued.clear) queued.push("clear");
+    if (status.queued.fullPass) queued.push("full re-index");
+    if (status.queued.changes > 0) queued.push(`${status.queued.changes} changed file${status.queued.changes === 1 ? "" : "s"}`);
+    if (status.queued.removals > 0) queued.push(`${status.queued.removals} removal${status.queued.removals === 1 ? "" : "s"}`);
+    if (queued.length > 0) {
+      return `Queued (runs after the quiet window): ${queued.join(", ")}.`;
+    }
+    const stats = await this.plugin.vectorStore.peekStats();
+    if (stats === null || stats.fileCount === 0 && stats.chunkCount === 0) {
+      return "No index yet \u2014 run Re-index to build one.";
+    }
+    const parts = [
+      `${stats.fileCount} file${stats.fileCount === 1 ? "" : "s"}`,
+      `${stats.chunkCount} chunk${stats.chunkCount === 1 ? "" : "s"}`
+    ];
+    const last = status.lastRun;
+    if (last && last.error) {
+      return `Index is up to date \u2014 ${parts.join(", ")}. Last run ${(0, import_obsidian3.moment)(last.finishedAt).fromNow()} failed: ${last.error}`;
+    }
+    if (last && last.kind === "file") {
+      return `Index is up to date \u2014 ${parts.join(", ")} (last: ${last.path ?? "one file"}, ${(0, import_obsidian3.moment)(last.finishedAt).fromNow()}).`;
+    }
+    if (last) {
+      const run = [`${last.indexed} indexed`];
+      if (last.skipped > 0) run.push(`${last.skipped} skipped`);
+      if (last.failed > 0) run.push(`${last.failed} failed`);
+      return `Index is up to date \u2014 ${parts.join(", ")} (last run ${(0, import_obsidian3.moment)(last.finishedAt).fromNow()}: ${run.join(", ")}).`;
+    }
+    return `Index is up to date \u2014 ${parts.join(", ")}, last indexed ${(0, import_obsidian3.moment)(stats.updatedAt).fromNow()}.`;
   }
 };
 
 // src/store/VectorStore.ts
+var fs3 = __toESM(require("fs"));
+
+// node_modules/@blackwell-systems/gcf/dist/constants.js
+var KIND_EXPAND = {
+  fn: "function",
+  type: "type",
+  method: "method",
+  iface: "interface",
+  var: "var",
+  const: "const",
+  resource: "resource",
+  table: "table",
+  class: "class",
+  selector: "selector",
+  field: "field",
+  route: "route_handler",
+  ext: "external",
+  file: "file",
+  pkg: "package",
+  svc: "service"
+};
+
+// node_modules/@blackwell-systems/gcf/dist/scalar.js
+var JSON_NUMBER_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+var NUMERIC_LIKE_RE = /^[+-]\.?\d|^\.\d|^0\d/;
+var INLINE_ARRAY_RE = /\[[^\]]*\]\s*:/;
+var I64_MIN = -9223372036854775808n;
+var I64_MAX = 9223372036854775807n;
+var MAX_SAFE = 9007199254740991n;
+var currentLargeInt = "error";
+function setLargeIntMode(mode) {
+  currentLargeInt = mode;
+}
+function outOfRangeMessage(value) {
+  return `out_of_range: integer ${value} is outside the canonical int64 domain [-9223372036854775808, 9223372036854775807]; model larger values as strings (SPEC 2.3.2)`;
+}
+function unsafeIntegerMessage(value) {
+  return `unsafe_integer: integer ${value} exceeds the safe-integer range (2^53-1) of a JavaScript number; decode with largeInt 'string' | 'bigint' | 'number', or model the value as a string (SPEC 2.3.2)`;
+}
+function needsQuote(s) {
+  if (s === "")
+    return true;
+  if (s === "-" || s === "~" || s === "^" || s === "true" || s === "false")
+    return true;
+  if (s.length >= 3 && s[0] === "^" && s[1] === "{" && s[s.length - 1] === "}")
+    return true;
+  if (JSON_NUMBER_RE.test(s))
+    return true;
+  if (NUMERIC_LIKE_RE.test(s))
+    return true;
+  if (s[0] === " " || s[s.length - 1] === " ")
+    return true;
+  if (s[0] === "#" || s[0] === "@" || s[0] === ".")
+    return true;
+  if (INLINE_ARRAY_RE.test(s))
+    return true;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 34 || c === 92 || c < 32 || c === 10 || c === 13 || c === 124 || c === 44)
+      return true;
+    if (c >= 128 && c <= 159)
+      return true;
+    if (c > 127 && (c === 160 || c === 8232 || c === 8233 || c === 65279 || c === 5760 || c >= 8192 && c <= 8202 || c === 8239 || c === 8287 || c === 12288))
+      return true;
+  }
+  return false;
+}
+function quoteString(s) {
+  let out = '"';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    switch (c) {
+      case 34:
+        out += '\\"';
+        break;
+      case 92:
+        out += "\\\\";
+        break;
+      case 8:
+        out += "\\b";
+        break;
+      case 12:
+        out += "\\f";
+        break;
+      case 10:
+        out += "\\n";
+        break;
+      case 13:
+        out += "\\r";
+        break;
+      case 9:
+        out += "\\t";
+        break;
+      default:
+        if (c < 32) {
+          out += "\\u" + c.toString(16).padStart(4, "0");
+        } else {
+          out += s[i];
+        }
+    }
+  }
+  return out + '"';
+}
+function formatScalar(v, delimiter = 0) {
+  if (v === null || v === void 0)
+    return "-";
+  if (typeof v === "boolean")
+    return v ? "true" : "false";
+  if (typeof v === "number")
+    return formatNumber(v);
+  if (typeof v === "bigint") {
+    if (v < I64_MIN || v > I64_MAX)
+      throw new Error(outOfRangeMessage(v.toString()));
+    return v.toString();
+  }
+  const s = String(v);
+  if (needsQuote(s) || delimiter && s.includes(String.fromCharCode(delimiter))) {
+    return quoteString(s);
+  }
+  return s;
+}
+function formatNumber(f) {
+  if (f === 0)
+    return "0";
+  const abs = Math.abs(f);
+  if (abs >= 1e-6 && abs < 9007199254740992) {
+    return toPreciseDecimal(f);
+  }
+  let s = f.toExponential();
+  s = s.replace(/[eE]\+?0*(\d)/, "e+$1").replace(/[eE]-0*(\d)/, "e-$1");
+  return s;
+}
+function toPreciseDecimal(f) {
+  return String(f);
+}
+var BARE_KEY_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+function isBareKey(s) {
+  return BARE_KEY_RE.test(s);
+}
+function formatKey(s) {
+  return isBareKey(s) ? s : quoteString(s);
+}
+function parseScalar(s, tabularContext) {
+  if (s === "")
+    return "";
+  if (s[0] === '"')
+    return parseQuotedString(s);
+  if (s === "-")
+    return null;
+  if (s === "~") {
+    if (!tabularContext)
+      throw new Error("invalid_missing: ~ outside tabular row cell");
+    return MISSING;
+  }
+  if (s === "^" || s.startsWith("^{") && s.endsWith("}")) {
+    if (!tabularContext)
+      throw new Error("invalid_attachment_marker: ^ outside tabular row cell");
+    if (s === "^")
+      return ATTACHMENT;
+    return { __inlineSchema: s.slice(1) };
+  }
+  if (s === "true")
+    return true;
+  if (s === "false")
+    return false;
+  if (JSON_NUMBER_RE.test(s)) {
+    if (!s.includes(".") && !s.includes("e") && !s.includes("E")) {
+      const b = BigInt(s);
+      if (b < I64_MIN || b > I64_MAX)
+        throw new Error(outOfRangeMessage(s));
+      if (b >= -MAX_SAFE && b <= MAX_SAFE)
+        return Number(b);
+      switch (currentLargeInt) {
+        case "string":
+          return s;
+        case "bigint":
+          return b;
+        case "number":
+          return Number(b);
+        case "error":
+        default:
+          throw new Error(unsafeIntegerMessage(s));
+      }
+    }
+    const f = Number(s);
+    if (!isNaN(f))
+      return f;
+  }
+  return s;
+}
+var MISSING = Symbol("missing");
+var ATTACHMENT = Symbol("attachment");
+function parseQuotedString(s) {
+  if (s.length < 2 || s[0] !== '"')
+    throw new Error("unterminated_quote");
+  let out = "";
+  let i = 1;
+  while (i < s.length) {
+    if (s[i] === '"') {
+      if (i + 1 !== s.length)
+        throw new Error("trailing_characters: after closing quote");
+      return out;
+    }
+    if (s[i] === "\\") {
+      if (i + 1 >= s.length)
+        throw new Error("unterminated_quote");
+      i++;
+      switch (s[i]) {
+        case '"':
+          out += '"';
+          break;
+        case "\\":
+          out += "\\";
+          break;
+        case "/":
+          out += "/";
+          break;
+        case "b":
+          out += "\b";
+          break;
+        case "f":
+          out += "\f";
+          break;
+        case "n":
+          out += "\n";
+          break;
+        case "r":
+          out += "\r";
+          break;
+        case "t":
+          out += "	";
+          break;
+        case "u": {
+          if (i + 4 >= s.length)
+            throw new Error("invalid_escape: incomplete unicode");
+          const hex = s.slice(i + 1, i + 5);
+          const code = parseInt(hex, 16);
+          if (isNaN(code))
+            throw new Error(`invalid_escape: invalid unicode \\u${hex}`);
+          if (code >= 55296 && code <= 56319) {
+            if (i + 10 >= s.length || s[i + 5] !== "\\" || s[i + 6] !== "u") {
+              throw new Error("invalid_surrogate: isolated high surrogate");
+            }
+            const hex2 = s.slice(i + 7, i + 11);
+            const low = parseInt(hex2, 16);
+            if (isNaN(low) || low < 56320 || low > 57343) {
+              throw new Error("invalid_surrogate: invalid low surrogate");
+            }
+            out += String.fromCodePoint(65536 + (code - 55296) * 1024 + (low - 56320));
+            i += 11;
+            continue;
+          }
+          if (code >= 56320 && code <= 57343) {
+            throw new Error("invalid_surrogate: isolated low surrogate");
+          }
+          out += String.fromCharCode(code);
+          i += 5;
+          continue;
+        }
+        default:
+          throw new Error(`invalid_escape: unknown \\${s[i]}`);
+      }
+      i++;
+      continue;
+    }
+    if (s.charCodeAt(i) < 32) {
+      throw new Error(`invalid_escape: unescaped control U+${s.charCodeAt(i).toString(16).padStart(4, "0")}`);
+    }
+    out += s[i];
+    i++;
+  }
+  throw new Error("unterminated_quote");
+}
+function splitRespectingQuotes(s, delim) {
+  const parts = [];
+  let current = "";
+  let inQuote = false;
+  let escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    if (escaped) {
+      current += s[i];
+      escaped = false;
+      continue;
+    }
+    if (s[i] === "\\" && inQuote) {
+      current += s[i];
+      escaped = true;
+      continue;
+    }
+    if (s[i] === '"') {
+      inQuote = !inQuote;
+      current += s[i];
+      continue;
+    }
+    if (s[i] === delim && !inQuote) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += s[i];
+  }
+  parts.push(current);
+  return parts;
+}
+function splitFieldDecl(s) {
+  if (s.length < 2 || s[0] !== "{")
+    throw new Error("invalid field declaration");
+  const closeIdx = findClosingBrace(s);
+  if (closeIdx < 0)
+    throw new Error("invalid field declaration");
+  const inner = s.slice(1, closeIdx);
+  if (!inner)
+    return [];
+  const raw = splitRespectingQuotes(inner, ",");
+  const fields = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const f of raw) {
+    const trimmed = f.trim();
+    let name;
+    if (trimmed.length >= 2 && trimmed[0] === '"' && trimmed[trimmed.length - 1] === '"') {
+      name = parseQuotedString(trimmed);
+    } else {
+      if (!isBareKey(trimmed))
+        throw new Error(`invalid field name: ${trimmed}`);
+      name = trimmed;
+    }
+    if (seen.has(name))
+      throw new Error(`duplicate_field_name: ${name}`);
+    seen.add(name);
+    fields.push(name);
+  }
+  return fields;
+}
+function findClosingBrace(s) {
+  let inQuote = false;
+  let escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (s[i] === "\\" && inQuote) {
+      escaped = true;
+      continue;
+    }
+    if (s[i] === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (s[i] === "}" && !inQuote)
+      return i;
+  }
+  return -1;
+}
+
+// node_modules/@blackwell-systems/gcf/dist/decode.js
+function decode(input) {
+  const lines = input.split("\n");
+  if (lines.length === 0) {
+    throw new Error("gcf: empty input");
+  }
+  const header = lines[0];
+  if (!header.startsWith("GCF ")) {
+    throw new Error(`gcf: invalid header, expected 'GCF ...' got "${header}"`);
+  }
+  const p = {
+    tool: "",
+    tokenBudget: 0,
+    tokensUsed: 0,
+    symbols: [],
+    edges: []
+  };
+  parseHeader(header.slice(4), p);
+  const isDelta = header.includes(" delta=true");
+  const validDeltaSections = /* @__PURE__ */ new Set(["removed", "added", "edges_removed", "edges_added"]);
+  const symbols = [];
+  const symByID = /* @__PURE__ */ new Map();
+  let currentDistance = 0;
+  let inEdges = false;
+  let declaredEdges = -1;
+  let edgesDeclared = false;
+  for (let i = 1; i < lines.length; i++) {
+    let line = lines[i].replace(/\r$/, "");
+    if (line === "")
+      continue;
+    if (line.startsWith("##! "))
+      continue;
+    if (line.startsWith("## ")) {
+      let group = line.slice(3);
+      let declaredCount = -1;
+      const bracketIdx = group.indexOf(" [");
+      if (bracketIdx >= 0) {
+        const bracket = group.slice(bracketIdx + 2);
+        group = group.slice(0, bracketIdx);
+        const end = bracket.indexOf("]");
+        if (end >= 0) {
+          const cntStr = bracket.slice(0, end);
+          if (cntStr !== "?") {
+            const n = parseInt(cntStr, 10);
+            if (isNaN(n))
+              throw new Error(`count_mismatch: invalid section count "${cntStr}"`);
+            declaredCount = n;
+          }
+        }
+      }
+      if (isDelta && !validDeltaSections.has(group)) {
+        throw new Error(`malformed_delta: invalid delta section "${group}"`);
+      }
+      inEdges = group === "edges";
+      if (inEdges && declaredCount >= 0) {
+        declaredEdges = declaredCount;
+        edgesDeclared = true;
+      }
+      if (!inEdges) {
+        switch (group) {
+          case "targets":
+            currentDistance = 0;
+            break;
+          case "related":
+            currentDistance = 1;
+            break;
+          case "extended":
+            currentDistance = 2;
+            break;
+          default:
+            if (group.startsWith("distance_")) {
+              const d = parseInt(group.slice(9), 10);
+              if (!isNaN(d)) {
+                currentDistance = d;
+              }
+            }
+            break;
+        }
+      }
+      continue;
+    }
+    if (line.startsWith("# ")) {
+      continue;
+    }
+    if (inEdges) {
+      const edge = parseEdgeLine(line, symByID);
+      p.edges.push(edge);
+    } else {
+      const { symbol, id } = parseSymbolLine(line, currentDistance);
+      symbols.push(symbol);
+      symByID.set(id, symbol);
+    }
+  }
+  if (edgesDeclared && p.edges.length !== declaredEdges) {
+    throw new Error(`count_mismatch: declared ${declaredEdges} edges, got ${p.edges.length}`);
+  }
+  p.symbols = symbols;
+  return p;
+}
+function parseHeader(fields, p) {
+  const parts = fields.split(/\s+/);
+  for (const part of parts) {
+    const eqIdx = part.indexOf("=");
+    if (eqIdx < 0)
+      continue;
+    const key = part.slice(0, eqIdx);
+    const value = part.slice(eqIdx + 1);
+    switch (key) {
+      case "tool":
+        p.tool = value;
+        break;
+      case "budget": {
+        const v = parseInt(value, 10);
+        if (isNaN(v))
+          throw new Error(`gcf: invalid budget "${value}"`);
+        p.tokenBudget = v;
+        break;
+      }
+      case "tokens": {
+        const v = parseInt(value, 10);
+        if (isNaN(v))
+          throw new Error(`gcf: invalid tokens "${value}"`);
+        p.tokensUsed = v;
+        break;
+      }
+      case "pack_root":
+        p.packRoot = value;
+        break;
+      case "symbols":
+        break;
+    }
+  }
+}
+function parseSymbolLine(line, distance) {
+  if (!line.startsWith("@")) {
+    throw new Error(`gcf: expected symbol line starting with @, got "${line}"`);
+  }
+  const parts = line.split(/\s+/);
+  if (parts.length < 5) {
+    throw new Error(`invalid_node_line: symbol line needs at least 5 fields, got ${parts.length} in "${line}"`);
+  }
+  const idStr = parts[0].slice(1);
+  const id = parseInt(idStr, 10);
+  if (isNaN(id)) {
+    throw new Error(`invalid_symbol_id: invalid symbol id "${idStr}"`);
+  }
+  let kind = parts[1];
+  if (KIND_EXPAND[kind]) {
+    kind = KIND_EXPAND[kind];
+  }
+  const qname = parts[2];
+  const score = parseFloat(parts[3]);
+  if (isNaN(score)) {
+    throw new Error(`invalid_score: invalid score "${parts[3]}"`);
+  }
+  const provenance = parts[4];
+  return {
+    symbol: {
+      qualifiedName: qname,
+      kind,
+      score,
+      provenance,
+      distance
+    },
+    id
+  };
+}
+function parseEdgeLine(line, symByID) {
+  const parts = line.split(/\s+/);
+  if (parts.length < 2) {
+    throw new Error(`gcf: edge line needs at least 2 fields, got "${line}"`);
+  }
+  const ref = parts[0];
+  const ltIdx = ref.indexOf("<");
+  if (ltIdx < 0) {
+    throw new Error(`invalid_edge_syntax: edge line missing '<' separator in "${ref}"`);
+  }
+  const targetIDStr = ref.slice(1, ltIdx);
+  const sourceIDStr = ref.slice(ltIdx + 2);
+  const targetID = parseInt(targetIDStr, 10);
+  if (isNaN(targetID)) {
+    throw new Error(`gcf: invalid target id "${targetIDStr}"`);
+  }
+  const sourceID = parseInt(sourceIDStr, 10);
+  if (isNaN(sourceID)) {
+    throw new Error(`gcf: invalid source id "${sourceIDStr}"`);
+  }
+  const targetSym = symByID.get(targetID);
+  const sourceSym = symByID.get(sourceID);
+  if (!targetSym || !sourceSym) {
+    throw new Error(`unknown_edge_reference: edge references unknown symbol id(s): target=${targetID} source=${sourceID}`);
+  }
+  const edgeType = parts[1];
+  const status = parts.length >= 3 ? parts[2] : void 0;
+  return {
+    source: sourceSym.qualifiedName,
+    target: targetSym.qualifiedName,
+    edgeType,
+    status
+  };
+}
+
+// node_modules/@blackwell-systems/gcf/dist/decode_generic.js
+function checkDupMap(m, key) {
+  if (m.has(key))
+    throw new Error(`duplicate_key: ${key}`);
+}
+function decodeGeneric(input, opts) {
+  setLargeIntMode(opts?.largeInt ?? "error");
+  try {
+    return decodeGenericImpl(input);
+  } finally {
+    setLargeIntMode("error");
+  }
+}
+function decodeGenericImpl(input) {
+  input = input.trimEnd();
+  if (!input)
+    throw new Error("missing_header: empty input");
+  const lines = input.split("\n");
+  const header = lines[0].replace(/\r$/, "");
+  if (!header.startsWith("GCF "))
+    throw new Error("missing_header: first line does not begin with GCF");
+  const profile = parseHeaderProfile(header);
+  if (profile === "graph") {
+    const p = decode(input);
+    return {
+      tool: p.tool,
+      tokenBudget: p.tokenBudget,
+      tokensUsed: p.tokensUsed,
+      packRoot: p.packRoot ?? "",
+      symbols: p.symbols.map((s) => ({
+        qualifiedName: s.qualifiedName,
+        kind: s.kind,
+        score: s.score,
+        provenance: s.provenance,
+        distance: s.distance
+      })),
+      edges: p.edges.map((e) => ({
+        source: e.source,
+        target: e.target,
+        edgeType: e.edgeType,
+        status: e.status ?? ""
+      }))
+    };
+  }
+  if (profile !== "generic")
+    throw new Error(`unknown_profile: ${profile}`);
+  const contentLines = [];
+  let summaryLine = "";
+  let deferredSectionCount = 0;
+  for (let i = 1; i < lines.length; i++) {
+    const l = lines[i].replace(/\r$/, "");
+    if (l === "")
+      continue;
+    for (let j = 0; j < l.length; j++) {
+      if (l[j] === "	")
+        throw new Error("tab_indentation: tabs in leading whitespace");
+      if (l[j] !== " ")
+        break;
+    }
+    const trimmed = l.trimStart();
+    if (trimmed.startsWith("# "))
+      continue;
+    if (trimmed.startsWith("##! ")) {
+      summaryLine = trimmed;
+      continue;
+    }
+    if (trimmed.startsWith("## ") && (trimmed.includes("[?]") || trimmed.includes("[?:]")))
+      deferredSectionCount++;
+    contentLines.push(l);
+  }
+  if (summaryLine && deferredSectionCount > 0) {
+    validateSummaryCounts(summaryLine, deferredSectionCount, contentLines);
+  }
+  if (contentLines.length === 0)
+    return /* @__PURE__ */ new Map();
+  const first = contentLines[0].trimStart();
+  if (first.startsWith("=")) {
+    if (contentLines.length > 1)
+      throw new Error("trailing_characters: extra lines after root scalar");
+    return parseScalar(first.slice(1), false);
+  }
+  if (first.startsWith("## [")) {
+    const [arr, consumed] = parseArrayFromHeader(contentLines, 0, 0, first.slice(3));
+    if (consumed < contentLines.length) {
+      throw new Error("count_mismatch: declared count is fewer than the rows present");
+    }
+    return arr;
+  }
+  const result = /* @__PURE__ */ new Map();
+  parseObjectBody(contentLines, 0, 0, result);
+  return result;
+}
+function parseHeaderProfile(header) {
+  const parts = header.split(/\s+/);
+  if (parts.length < 2)
+    throw new Error("missing_profile");
+  const seen = /* @__PURE__ */ new Set();
+  let profile = "";
+  for (let i = 1; i < parts.length; i++) {
+    const eq = parts[i].indexOf("=");
+    if (eq < 0)
+      throw new Error(`malformed_header_field: ${parts[i]}`);
+    const key = parts[i].slice(0, eq);
+    if (seen.has(key))
+      throw new Error(`duplicate_header_field: ${key}`);
+    seen.add(key);
+    if (key === "profile")
+      profile = parts[i].slice(eq + 1);
+  }
+  if (!profile)
+    throw new Error("missing_profile");
+  return profile;
+}
+function parseObjectBody(lines, start, depth, out) {
+  const ind = "  ".repeat(depth);
+  let i = start;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (depth > 0 && !line.startsWith(ind))
+      break;
+    const content = depth > 0 ? line.slice(ind.length) : line;
+    if (content.length > 0 && content[0] === " ") {
+      throw new Error("invalid_indent: indentation increases by more than one level");
+    }
+    if (content.startsWith("## ")) {
+      const hdr = content.slice(3);
+      const bi = findHeaderBracketStart(hdr);
+      if (bi >= 0) {
+        const name2 = parseKeyFromHeader(hdr.slice(0, bi));
+        checkDupMap(out, name2);
+        const [arr, consumed2] = parseArrayFromHeader(lines, i, depth, hdr.slice(bi));
+        out.set(name2, arr);
+        i += consumed2;
+        continue;
+      }
+      const name = parseKeyFromHeader(hdr);
+      checkDupMap(out, name);
+      i++;
+      const nested = /* @__PURE__ */ new Map();
+      const consumed = parseObjectBody(lines, i, depth + 1, nested);
+      out.set(name, nested);
+      i += consumed;
+      continue;
+    }
+    const eqIdx = findKeyValueSplit(content);
+    if (eqIdx > 0) {
+      const name = parseKeyFromHeader(content.slice(0, eqIdx));
+      checkDupMap(out, name);
+      out.set(name, parseScalar(content.slice(eqIdx + 1), false));
+      i++;
+      continue;
+    }
+    if (!content.startsWith("@") && !content.startsWith("##")) {
+      const bracketIdx = arrayBracketStart(content);
+      if (bracketIdx > 0) {
+        const rest = content.slice(bracketIdx);
+        const closeIdx = rest.indexOf("]");
+        if (closeIdx >= 0) {
+          const after = rest.slice(closeIdx + 1);
+          if (after.startsWith(": ") || after === ":") {
+            const name = parseKeyFromHeader(content.slice(0, bracketIdx));
+            checkDupMap(out, name);
+            const [arr] = parseArrayFromHeader(lines, i, depth, rest);
+            out.set(name, arr);
+            i++;
+            continue;
+          }
+        }
+      }
+    }
+    if (content.includes("|")) {
+      throw new Error(`orphan_inline_attachment: ${content}`);
+    }
+    throw new Error(`invalid_line: unexpected content in object body: ${JSON.stringify(content)}`);
+  }
+  return i - start;
+}
+function findKeyValueSplit(s) {
+  if (!s.length)
+    return -1;
+  if (s[0] === '"') {
+    for (let i = 1; i < s.length; i++) {
+      if (s[i] === "\\") {
+        i++;
+        continue;
+      }
+      if (s[i] === '"')
+        return i + 1 < s.length && s[i + 1] === "=" ? i + 1 : -1;
+    }
+    return -1;
+  }
+  const eqIdx = s.indexOf("=");
+  if (eqIdx < 0)
+    return -1;
+  const bracketIdx = s.indexOf("[");
+  if (bracketIdx >= 0 && bracketIdx < eqIdx)
+    return -1;
+  return eqIdx;
+}
+function arrayBracketStart(content) {
+  if (content.charCodeAt(0) === 34) {
+    let escaped = false;
+    for (let i = 1; i < content.length; i++) {
+      if (escaped) {
+        escaped = false;
+      } else if (content[i] === "\\") {
+        escaped = true;
+      } else if (content[i] === '"') {
+        return content[i + 1] === "[" ? i + 1 : -1;
+      }
+    }
+    return -1;
+  }
+  return content.indexOf("[");
+}
+function findHeaderBracketStart(hdr) {
+  let i = 0;
+  if (hdr[0] === '"') {
+    i = 1;
+    while (i < hdr.length) {
+      if (hdr[i] === "\\") {
+        i += 2;
+        continue;
+      }
+      if (hdr[i] === '"') {
+        i++;
+        break;
+      }
+      i++;
+    }
+  }
+  const bi = hdr.indexOf(" [", i);
+  return bi;
+}
+function parseKeyFromHeader(s) {
+  s = s.trim();
+  if (s.length >= 2 && s[0] === '"')
+    return parseQuotedString(s);
+  return s;
+}
+function isUnsafePathKey(k) {
+  return k === "__proto__" || k === "constructor" || k === "prototype";
+}
+function parseArrayFromHeader(lines, headerLine, depth, bracketPart) {
+  const bp = bracketPart.trimStart();
+  if (!bp.startsWith("["))
+    throw new Error("invalid_count");
+  const closeIdx = bp.indexOf("]");
+  if (closeIdx < 0)
+    throw new Error("invalid_count");
+  let countStr = bp.slice(1, closeIdx);
+  const afterBracket = bp.slice(closeIdx + 1);
+  const keyed = countStr.endsWith(":");
+  if (keyed) {
+    countStr = countStr.slice(0, -1);
+    if (!afterBracket.startsWith("{"))
+      throw new Error("keyed_map: missing field declaration");
+  }
+  let count = -1;
+  if (countStr !== "?")
+    count = parseCount(countStr);
+  if (keyed && count === 0) {
+    throw new Error("keyed_map: zero count [0:] is invalid (an empty object uses Section 7.7)");
+  }
+  if (count === 0 && !afterBracket.startsWith("{") && !afterBracket.startsWith(":")) {
+    return [[], 1];
+  }
+  if (afterBracket.startsWith(": ") || afterBracket === ":") {
+    const valsStr = afterBracket.startsWith(": ") ? afterBracket.slice(2) : "";
+    if (!valsStr) {
+      if (count >= 0 && count !== 0)
+        throw new Error(`count_mismatch: declared ${count}, got 0`);
+      return [[], 1];
+    }
+    const vals = splitRespectingQuotes(valsStr, ",");
+    if (count >= 0 && vals.length !== count)
+      throw new Error(`count_mismatch: declared ${count}, got ${vals.length}`);
+    return [vals.map((v) => parseScalar(v.trim(), false)), 1];
+  }
+  if (afterBracket.startsWith("{")) {
+    const braceEnd = findClosingBrace2(afterBracket);
+    if (braceEnd < 0)
+      throw new Error("invalid field declaration");
+    const fields = splitFieldDecl(afterBracket.slice(0, braceEnd + 1));
+    const [rows, consumed2] = parseTabularBody(lines, headerLine + 1, depth, fields, count);
+    if (count >= 0 && rows.length !== count)
+      throw new Error(`count_mismatch: declared ${count}, got ${rows.length}`);
+    if (keyed)
+      return [keyedRowsToMap(rows, fields), consumed2 + 1];
+    return [rows, consumed2 + 1];
+  }
+  const [items, consumed] = parseExpandedBody(lines, headerLine + 1, depth);
+  if (count >= 0 && items.length !== count)
+    throw new Error(`count_mismatch: declared ${count}, got ${items.length}`);
+  return [items, consumed + 1];
+}
+function keyedRowsToMap(rows, fields) {
+  if (fields.length < 2)
+    throw new Error("keyed_map: header must declare at least two fields");
+  const keyLabel = fields[0];
+  const out = /* @__PURE__ */ new Map();
+  for (const row of rows) {
+    const kv = row.has(keyLabel) ? row.get(keyLabel) : void 0;
+    const ks = typeof kv === "string" ? kv : String(kv);
+    if (out.has(ks))
+      throw new Error(`keyed_map: duplicate member key ${ks}`);
+    const value = /* @__PURE__ */ new Map();
+    for (const [f, v] of row) {
+      if (f === keyLabel)
+        continue;
+      value.set(f, v);
+    }
+    out.set(ks, value);
+  }
+  return out;
+}
+function findClosingBrace2(s) {
+  let inQuote = false, escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (s[i] === "\\" && inQuote) {
+      escaped = true;
+      continue;
+    }
+    if (s[i] === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (s[i] === "}" && !inQuote)
+      return i;
+  }
+  return -1;
+}
+function unflattenPaths(pathColumns, flatValues, flatAbsent) {
+  const groups = /* @__PURE__ */ new Map();
+  const groupOrder = [];
+  for (const [fieldName, paths] of pathColumns) {
+    if (paths.length === 0)
+      continue;
+    if (paths.some(isUnsafePathKey))
+      continue;
+    const top = paths[0];
+    if (!groups.has(top)) {
+      groups.set(top, []);
+      groupOrder.push(top);
+    }
+    groups.get(top).push(fieldName);
+  }
+  const result = /* @__PURE__ */ new Map();
+  for (const top of groupOrder) {
+    const fieldNames = groups.get(top);
+    const allAbsent = fieldNames.every((f) => flatAbsent.has(f));
+    const allNull = fieldNames.every((f) => {
+      if (flatAbsent.has(f))
+        return false;
+      const val = flatValues.get(f);
+      return val === null;
+    });
+    if (allAbsent)
+      continue;
+    if (allNull) {
+      result.set(top, null);
+      continue;
+    }
+    for (const fieldName of fieldNames) {
+      if (flatAbsent.has(fieldName))
+        continue;
+      const paths = pathColumns.get(fieldName);
+      const val = flatValues.has(fieldName) ? flatValues.get(fieldName) : null;
+      let current = result;
+      for (let k = 0; k < paths.length - 1; k++) {
+        const segment = paths[k];
+        const existing = current.get(segment);
+        if (!current.has(segment) || !(existing instanceof Map)) {
+          current.set(segment, /* @__PURE__ */ new Map());
+        }
+        current = current.get(segment);
+      }
+      current.set(paths[paths.length - 1], val);
+    }
+  }
+  return result;
+}
+function parseTabularBody(lines, start, depth, fields, expectedCount) {
+  const ind = "  ".repeat(depth);
+  const rows = [];
+  let i = start;
+  const pathColumnMap = /* @__PURE__ */ new Map();
+  for (const f of fields) {
+    if (f.includes(">")) {
+      const parts = f.split(">");
+      if (parts.every((p) => p.length > 0)) {
+        pathColumnMap.set(f, parts);
+      }
+    }
+  }
+  const inlineSchemas = /* @__PURE__ */ new Map();
+  const sharedArraySchemas = /* @__PURE__ */ new Map();
+  while (i < lines.length) {
+    const line = lines[i];
+    const content = depth > 0 ? line.startsWith(ind) ? line.slice(ind.length) : null : line;
+    if (content === null)
+      break;
+    if (content.startsWith("## ") || content.startsWith("##!"))
+      break;
+    if (content.length > 0 && content[0] === " ") {
+      const trimmed = content.trimStart();
+      if (trimmed.startsWith("."))
+        break;
+      break;
+    }
+    let rowData = content;
+    let rowHasID = false;
+    if (rowData.startsWith("@")) {
+      const sp = rowData.indexOf(" ");
+      if (sp > 0) {
+        const idStr = rowData.slice(1, sp);
+        if (/^\d+$/.test(idStr)) {
+          rowData = rowData.slice(sp + 1);
+          rowHasID = true;
+        }
+      }
+    }
+    const vals = splitRespectingQuotes(rowData, "|");
+    if (vals.length !== fields.length)
+      throw new Error(`row_width_mismatch: expected ${fields.length}, got ${vals.length}`);
+    const cellValues = /* @__PURE__ */ new Map();
+    const traditionalAttFields = [];
+    const inlineAttFields = [];
+    const inlineAttOrder = [];
+    const missingFields = /* @__PURE__ */ new Set();
+    const flatValues = /* @__PURE__ */ new Map();
+    const flatAbsent = /* @__PURE__ */ new Set();
+    for (let j = 0; j < fields.length; j++) {
+      const cellVal = vals[j];
+      if (pathColumnMap.has(fields[j])) {
+        const parsed2 = parseScalar(cellVal, true);
+        if (parsed2 === MISSING) {
+          flatAbsent.add(fields[j]);
+        } else {
+          flatValues.set(fields[j], parsed2);
+        }
+        continue;
+      }
+      if (cellVal.startsWith("^{") && cellVal.endsWith("}")) {
+        const schemaStr = cellVal.slice(1);
+        const ifs = splitFieldDecl(schemaStr);
+        inlineSchemas.set(fields[j], ifs);
+        inlineAttFields.push(fields[j]);
+        inlineAttOrder.push(fields[j]);
+        continue;
+      }
+      const parsed = parseScalar(cellVal, true);
+      if (parsed === MISSING) {
+        missingFields.add(fields[j]);
+        continue;
+      }
+      if (parsed === ATTACHMENT) {
+        if (inlineSchemas.has(fields[j])) {
+          inlineAttFields.push(fields[j]);
+          inlineAttOrder.push(fields[j]);
+        } else {
+          traditionalAttFields.push(fields[j]);
+        }
+        continue;
+      }
+      if (parsed && typeof parsed === "object" && parsed.__inlineSchema) {
+        const ifs = splitFieldDecl(parsed.__inlineSchema);
+        inlineSchemas.set(fields[j], ifs);
+        inlineAttFields.push(fields[j]);
+        inlineAttOrder.push(fields[j]);
+        continue;
+      }
+      cellValues.set(fields[j], parsed);
+    }
+    i++;
+    const allAttFields = [...traditionalAttFields, ...inlineAttFields];
+    const attachmentValues = /* @__PURE__ */ new Map();
+    const expectedAtt = new Set(allAttFields);
+    if (rowHasID) {
+      let inlineIdx = 0;
+      while (i < lines.length) {
+        const aLine = lines[i];
+        let aContent = null;
+        if (depth === 0 || aLine.startsWith(ind)) {
+          aContent = depth > 0 ? aLine.slice(ind.length) : aLine;
+        } else {
+          break;
+        }
+        if (aContent === null)
+          break;
+        let attContent = aContent;
+        if (!attContent.startsWith(".") && attContent.startsWith("  .")) {
+          attContent = attContent.slice(2);
+        }
+        if (attContent.startsWith(".")) {
+          const rest = attContent.slice(1);
+          const [attName, afterName] = parseAttachmentName(rest);
+          if (!expectedAtt.has(attName) && !attName.includes(">")) {
+            throw new Error(`orphan_attachment: ${attName}`);
+          }
+          const ifs2 = inlineSchemas.get(attName);
+          if (ifs2 && !afterName.trimStart().startsWith("{}") && !afterName.trimStart().startsWith("[")) {
+            const data = afterName.trimStart();
+            const inlineVals2 = splitRespectingQuotes(data, "|");
+            if (inlineVals2.length !== ifs2.length)
+              throw new Error(`inline_width_mismatch: ${attName} expected ${ifs2.length}, got ${inlineVals2.length}`);
+            const obj2 = /* @__PURE__ */ new Map();
+            for (let k = 0; k < ifs2.length; k++) {
+              const p = parseScalar(inlineVals2[k], true);
+              if (p !== MISSING)
+                obj2.set(ifs2[k], p);
+            }
+            if (attachmentValues.has(attName))
+              throw new Error(`duplicate_attachment: ${attName}`);
+            attachmentValues.set(attName, obj2);
+            i++;
+            continue;
+          }
+          const [name, val, consumed, parsedFields] = parseAttachment(lines, i, rest, depth + 2, sharedArraySchemas);
+          if (attachmentValues.has(name))
+            throw new Error(`duplicate_attachment: ${name}`);
+          if (rows.length === 0 && parsedFields) {
+            sharedArraySchemas.set(name, parsedFields);
+          }
+          attachmentValues.set(name, val);
+          i += consumed;
+          continue;
+        }
+        let foundInline = false;
+        let nextInlineField = "";
+        while (inlineIdx < inlineAttOrder.length) {
+          const candidate = inlineAttOrder[inlineIdx];
+          if (!attachmentValues.has(candidate)) {
+            nextInlineField = candidate;
+            foundInline = true;
+            break;
+          }
+          inlineIdx++;
+        }
+        if (!foundInline)
+          break;
+        const ifs = inlineSchemas.get(nextInlineField);
+        const inlineVals = splitRespectingQuotes(aContent, "|");
+        if (inlineVals.length !== ifs.length)
+          throw new Error(`inline_width_mismatch: ${nextInlineField} expected ${ifs.length}, got ${inlineVals.length}`);
+        const obj = /* @__PURE__ */ new Map();
+        for (let k = 0; k < ifs.length; k++) {
+          const p = parseScalar(inlineVals[k], true);
+          if (p !== MISSING)
+            obj.set(ifs[k], p);
+        }
+        attachmentValues.set(nextInlineField, obj);
+        inlineIdx++;
+        i++;
+      }
+      for (const f of allAttFields) {
+        if (!attachmentValues.has(f))
+          throw new Error(`missing_attachment: ${f}`);
+      }
+      if (i < lines.length) {
+        let peekContent = null;
+        if (depth === 0 || lines[i].startsWith(ind)) {
+          peekContent = depth > 0 ? lines[i].slice(ind.length) : lines[i];
+        }
+        if (peekContent !== null) {
+          let peekAtt = peekContent;
+          if (!peekAtt.startsWith(".") && peekAtt.startsWith("  .")) {
+            peekAtt = peekAtt.slice(2);
+          }
+          if (peekAtt.startsWith(".")) {
+            const peekRest = peekAtt.slice(1);
+            const [peekName] = parseAttachmentName(peekRest);
+            if (attachmentValues.has(peekName)) {
+              throw new Error(`duplicate_attachment: ${peekName}`);
+            }
+          }
+        }
+      }
+    }
+    const nested = pathColumnMap.size > 0 ? unflattenPaths(pathColumnMap, flatValues, flatAbsent) : /* @__PURE__ */ new Map();
+    const emittedGroups = /* @__PURE__ */ new Set();
+    const row = /* @__PURE__ */ new Map();
+    for (const f of fields) {
+      if (pathColumnMap.has(f)) {
+        const top = pathColumnMap.get(f)[0];
+        if (emittedGroups.has(top))
+          continue;
+        emittedGroups.add(top);
+        if (nested.has(top))
+          row.set(top, nested.get(top));
+        continue;
+      }
+      if (missingFields.has(f))
+        continue;
+      if (cellValues.has(f)) {
+        row.set(f, cellValues.get(f));
+        continue;
+      }
+      if (attachmentValues.has(f)) {
+        row.set(f, attachmentValues.get(f));
+        continue;
+      }
+    }
+    for (const [k, v] of attachmentValues) {
+      if (!row.has(k))
+        row.set(k, v);
+    }
+    rows.push(row);
+    if (expectedCount >= 0 && rows.length >= expectedCount)
+      break;
+  }
+  return [rows, i - start];
+}
+function parseAttachmentName(rest) {
+  if (rest[0] === '"') {
+    for (let j = 1; j < rest.length; j++) {
+      if (rest[j] === "\\") {
+        j++;
+        continue;
+      }
+      if (rest[j] === '"') {
+        const name = parseQuotedString(rest.slice(0, j + 1));
+        return [name, rest.slice(j + 1)];
+      }
+    }
+    return ["", rest];
+  }
+  const sp = rest.indexOf(" ");
+  if (sp >= 0)
+    return [rest.slice(0, sp), rest.slice(sp)];
+  return [rest, ""];
+}
+function parseAttachment(lines, lineIdx, rest, depth, sharedSchemas) {
+  const [name, afterNameRaw] = parseAttachmentName(rest);
+  const afterName = afterNameRaw.trimStart();
+  if (afterName.startsWith("{}")) {
+    const nested = /* @__PURE__ */ new Map();
+    const consumed = parseObjectBody(lines, lineIdx + 1, depth, nested);
+    return [name, nested, consumed + 1, null];
+  }
+  if (afterName.startsWith("[")) {
+    const closeBracket = afterName.indexOf("]");
+    if (closeBracket < 0)
+      throw new Error("invalid_count: missing ]");
+    const afterClose = afterName.slice(closeBracket + 1);
+    if (afterClose.startsWith("{")) {
+      const isKeyed = afterName.slice(1, closeBracket).endsWith(":");
+      const endBrace = findClosingBrace2(afterClose);
+      let parsedFields = null;
+      if (!isKeyed && endBrace >= 0) {
+        try {
+          parsedFields = splitFieldDecl(afterClose.slice(0, endBrace + 1));
+        } catch {
+        }
+      }
+      const [arr2, consumed2] = parseArrayFromHeader(lines, lineIdx, depth, afterName);
+      return [name, arr2, consumed2, parsedFields];
+    }
+    const afterCloseForInline = afterName.slice(closeBracket + 1);
+    if (afterCloseForInline.startsWith(": ") || afterCloseForInline === ":") {
+      const [arr2, consumed2] = parseArrayFromHeader(lines, lineIdx, depth, afterName);
+      return [name, arr2, consumed2, null];
+    }
+    if (sharedSchemas.has(name)) {
+      const sf = sharedSchemas.get(name);
+      const countStr = afterName.slice(1, closeBracket);
+      let count = -1;
+      if (countStr !== "?") {
+        try {
+          count = parseCount(countStr);
+        } catch {
+          count = -1;
+        }
+      }
+      if (count === 0)
+        return [name, [], 1, null];
+      const nextIdx = lineIdx + 1;
+      const ind = "  ".repeat(depth);
+      let useShared = true;
+      if (nextIdx < lines.length) {
+        let nextContent = lines[nextIdx];
+        if (depth > 0 && nextContent.startsWith(ind))
+          nextContent = nextContent.slice(ind.length);
+        if (nextContent.trimStart().startsWith("@"))
+          useShared = false;
+      }
+      if (useShared) {
+        const [rows, consumed2] = parseTabularBody(lines, lineIdx + 1, depth, sf, count);
+        if (count >= 0 && rows.length !== count)
+          throw new Error(`count_mismatch: declared ${count}, got ${rows.length}`);
+        return [name, rows, consumed2 + 1, null];
+      }
+    }
+    const [arr, consumed] = parseArrayFromHeader(lines, lineIdx, depth, afterName);
+    return [name, arr, consumed, null];
+  }
+  if (afterName.startsWith("=")) {
+    const valStr = afterName.slice(1);
+    const parsed = parseScalar(valStr, true);
+    if (parsed === MISSING)
+      return [name, null, 1, null];
+    return [name, parsed, 1, null];
+  }
+  throw new Error(`invalid attachment form: ${afterName}`);
+}
+function parseExpandedBody(lines, start, depth) {
+  const ind = "  ".repeat(depth);
+  const items = [];
+  let i = start;
+  while (i < lines.length) {
+    const line = lines[i];
+    const content = depth > 0 ? line.startsWith(ind) ? line.slice(ind.length) : null : line;
+    if (content === null)
+      break;
+    if (content.startsWith("## ") || content.startsWith("##!"))
+      break;
+    if (!content.startsWith("@"))
+      break;
+    const sp = content.indexOf(" ");
+    if (sp < 0)
+      break;
+    const idStr = content.slice(1, sp);
+    const id = parseInt(idStr, 10);
+    if (!isNaN(id) && id !== items.length) {
+      throw new Error(`invalid_item_id: expected @${items.length}, got @${idStr}`);
+    }
+    const marker = content.slice(sp + 1);
+    if (marker.startsWith("=")) {
+      items.push(parseScalar(marker.slice(1), false));
+      i++;
+      continue;
+    }
+    if (marker.startsWith("{}")) {
+      const nested = /* @__PURE__ */ new Map();
+      i++;
+      const consumed = parseObjectBody(lines, i, depth + 1, nested);
+      items.push(nested);
+      i += consumed;
+      continue;
+    }
+    if (marker.startsWith("[")) {
+      const [arr, consumed] = parseArrayFromHeader(lines, i, depth + 1, marker);
+      items.push(arr);
+      i += consumed;
+      continue;
+    }
+    break;
+  }
+  return [items, i - start];
+}
+function parseCount(s) {
+  if (s === "0")
+    return 0;
+  if (!s.length || s[0] === "0")
+    throw new Error(`invalid_count: ${s}`);
+  const n = parseInt(s, 10);
+  if (isNaN(n) || String(n) !== s)
+    throw new Error(`invalid_count: ${s}`);
+  return n;
+}
+function validateSummaryCounts(summaryLine, deferredCount, contentLines) {
+  const parts = summaryLine.split(/\s+/);
+  let countsStr = "";
+  for (const p of parts) {
+    if (p.startsWith("counts=")) {
+      countsStr = p.slice(7);
+      break;
+    }
+  }
+  if (!countsStr)
+    return;
+  const countVals = countsStr.split(",");
+  if (countVals.length !== deferredCount) {
+    throw new Error(`count_mismatch: summary has ${countVals.length} count entries but ${deferredCount} deferred sections`);
+  }
+  const actualCounts = [];
+  let inDeferred = false;
+  let currentCount = 0;
+  for (const l of contentLines) {
+    const trimmed = l.trimStart();
+    if (trimmed.startsWith("## ") && (trimmed.includes("[?]") || trimmed.includes("[?:]"))) {
+      if (inDeferred)
+        actualCounts.push(currentCount);
+      inDeferred = true;
+      currentCount = 0;
+      continue;
+    }
+    if (trimmed.startsWith("## ")) {
+      if (inDeferred) {
+        actualCounts.push(currentCount);
+        inDeferred = false;
+      }
+      continue;
+    }
+    if (inDeferred && !trimmed.startsWith(" ") && !trimmed.startsWith(".")) {
+      currentCount++;
+    }
+  }
+  if (inDeferred)
+    actualCounts.push(currentCount);
+  for (let i = 0; i < countVals.length; i++) {
+    const declared = parseInt(countVals[i], 10);
+    if (isNaN(declared))
+      throw new Error(`count_mismatch: invalid count value "${countVals[i]}"`);
+    if (i < actualCounts.length && declared !== actualCounts[i]) {
+      throw new Error(`count_mismatch: section ${i} declared ${declared} in summary, actual ${actualCounts[i]}`);
+    }
+  }
+}
+
+// node_modules/@blackwell-systems/gcf/dist/generic_delta_session.js
+var ReanchorMode;
+(function(ReanchorMode2) {
+  ReanchorMode2[ReanchorMode2["FixedN"] = 0] = "FixedN";
+  ReanchorMode2[ReanchorMode2["SizeGuard"] = 1] = "SizeGuard";
+})(ReanchorMode || (ReanchorMode = {}));
+
+// node_modules/@blackwell-systems/gcf/dist/stream_generic.js
+var GenericStreamEncoder = class {
+  constructor(writer) {
+    __publicField(this, "writer");
+    __publicField(this, "sections", []);
+    __publicField(this, "current", null);
+    __publicField(this, "err", null);
+    this.writer = writer;
+    this.writer.write("GCF profile=generic\n");
+  }
+  /** Start a tabular array section with deferred count [?]. */
+  beginArray(name, fields) {
+    if (this.err !== null) {
+      return;
+    }
+    if (this.current !== null) {
+      this.endArrayInternal();
+    }
+    for (const f of fields) {
+      if (f.includes(">")) {
+        this.err = new Error(`streaming field name ${JSON.stringify(f)} contains '>' (a flattened path is not representable in a streaming row)`);
+        return;
+      }
+    }
+    this.writer.write(`## ${formatKey(name)} [?]{${formatFieldDecl(fields)}}
+`);
+    this.current = { name, fields, count: 0 };
+  }
+  /** Start a keyed-map section with deferred count [?:] (SPEC 7.2a).
+   *  keyLabel is the key column; valueFields are the value-object fields. Each
+   *  writeRow value slice is [keyValue, ...valueFields]. */
+  beginKeyedMap(name, keyLabel, valueFields) {
+    if (this.err !== null) {
+      return;
+    }
+    if (this.current !== null) {
+      this.endArrayInternal();
+    }
+    for (const f of valueFields) {
+      if (f.includes(">")) {
+        this.err = new Error(`streaming field name ${JSON.stringify(f)} contains '>' (a flattened path is not representable in a streaming row)`);
+        return;
+      }
+    }
+    const fields = [keyLabel, ...valueFields];
+    this.writer.write(`## ${formatKey(name)} [?:]{${formatFieldDecl(fields)}}
+`);
+    this.current = { name, fields, count: 0 };
+  }
+  /** Emit a single pipe-separated row immediately. */
+  writeRow(values) {
+    if (this.current === null) {
+      return;
+    }
+    const parts = values.map(formatValue);
+    this.writer.write(`${parts.join("|")}
+`);
+    this.current.count++;
+  }
+  /** Close the current array section and record its count. */
+  endArray() {
+    this.endArrayInternal();
+  }
+  /** Emit a key=value line immediately. */
+  writeKV(key, value) {
+    this.writer.write(`${key}=${formatValue(value)}
+`);
+  }
+  /** Start a nested object section (## key). */
+  writeSection(name) {
+    if (this.current !== null) {
+      this.endArrayInternal();
+    }
+    this.writer.write(`## ${name}
+`);
+  }
+  /** Emit a primitive array inline: name[N]: val1,val2,val3 */
+  writeInlineArray(name, values) {
+    const parts = values.map(formatValue);
+    this.writer.write(`${name}[${values.length}]: ${parts.join(",")}
+`);
+  }
+  /** Emit the ##! summary trailer with final counts. Must be called after all data.
+   *  Throws if a rejected field name (containing ">") was passed to beginArray. */
+  close() {
+    if (this.err !== null) {
+      throw this.err;
+    }
+    if (this.current !== null) {
+      this.endArrayInternal();
+    }
+    if (this.sections.length === 0) {
+      return;
+    }
+    const counts = this.sections.map((s) => String(s.count));
+    this.writer.write(`##! summary counts=${counts.join(",")}
+`);
+  }
+  endArrayInternal() {
+    if (this.current === null) {
+      return;
+    }
+    this.sections.push({ name: this.current.name, count: this.current.count });
+    this.current = null;
+  }
+};
+function formatValue(v) {
+  return formatScalar(v, 124);
+}
+function formatFieldDecl(fields) {
+  return fields.map(formatKey).join(",");
+}
+
+// src/store/vectorCodec.ts
+var zlib = __toESM(require("zlib"));
+var VECTOR_CODEC = "f64le-deflate-base64";
+function encodeVector(values) {
+  if (values.length === 0) return "";
+  const bytes = new Uint8Array(values.length * 8);
+  const view = new DataView(bytes.buffer);
+  for (let i = 0; i < values.length; i++) {
+    view.setFloat64(i * 8, values[i], true);
+  }
+  return zlib.deflateSync(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)).toString("base64");
+}
+function decodeVector2(cell) {
+  if (cell === "") return new Float64Array(0);
+  const bytes = zlib.inflateSync(Buffer.from(cell, "base64"));
+  return new Float64Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 8);
+}
+
+// src/store/gcfIndex.ts
+var INDEX_FORMAT_VERSION = 1;
 var CURRENT_SCHEMA_VERSION = 2;
+var FILES_FIELDS = ["vaultPath", "mtime", "chunkCount"];
+var CHUNKS_FIELDS = ["id", "vaultPath", "page", "chunkIndex", "sourceType", "text", "embedding"];
+var VAULT_PATH_COLUMN = 1;
+function metaOf(embeddingModel, createdAt, updatedAt) {
+  return {
+    formatVersion: INDEX_FORMAT_VERSION,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    embeddingModel,
+    embeddingDimension: 0,
+    vectorCodec: VECTOR_CODEC,
+    createdAt,
+    updatedAt
+  };
+}
+function emptyMeta(embeddingModel) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  return metaOf(embeddingModel, now, now);
+}
+function formatCell(value) {
+  return formatScalar(value, 124);
+}
+function encodeFileRow(f) {
+  return [f.vaultPath, f.mtime, f.chunkCount].map(formatCell).join("|");
+}
+var FILES_SECTION_HEADER = `## files [?]{${FILES_FIELDS.join(",")}}`;
+var CHUNKS_SECTION_HEADER = `## chunks [?]{${CHUNKS_FIELDS.join(",")}}`;
+function documentHeader(meta) {
+  const lines = ["GCF profile=generic"];
+  const kv = (key, value) => lines.push(`${key}=${formatCell(value)}`);
+  kv("formatVersion", meta.formatVersion);
+  kv("schemaVersion", meta.schemaVersion);
+  kv("embeddingModel", meta.embeddingModel);
+  kv("embeddingDimension", meta.embeddingDimension);
+  kv("vectorCodec", meta.vectorCodec);
+  kv("createdAt", meta.createdAt);
+  kv("updatedAt", meta.updatedAt);
+  return lines.join("\n") + "\n";
+}
+function encodeIndexDocument(meta, fileRecords, chunkRowTexts) {
+  return documentHeader(meta) + `${FILES_SECTION_HEADER}
+` + (fileRecords.length > 0 ? fileRecords.map(encodeFileRow).join("\n") + "\n" : "") + `${CHUNKS_SECTION_HEADER}
+` + (chunkRowTexts.length > 0 ? chunkRowTexts.join("\n") + "\n" : "") + `##! summary counts=${fileRecords.length},${chunkRowTexts.length}
+`;
+}
+function splitRow(line) {
+  const parts = [];
+  let current = "";
+  let inQuote = false;
+  let escaped = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (escaped) {
+      current += c;
+      escaped = false;
+      continue;
+    }
+    if (c === "\\" && inQuote) {
+      current += c;
+      escaped = true;
+      continue;
+    }
+    if (c === '"') {
+      inQuote = !inQuote;
+      current += c;
+      continue;
+    }
+    if (c === "|" && !inQuote) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += c;
+  }
+  parts.push(current);
+  return parts;
+}
+function extractCell(line, index) {
+  let inQuote = false;
+  let escaped = false;
+  let cell = 0;
+  let start = -1;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (inQuote) {
+      if (c === "\\") escaped = true;
+      else if (c === '"') inQuote = false;
+      continue;
+    }
+    if (c === '"') {
+      inQuote = true;
+      if (start < 0) start = i;
+      continue;
+    }
+    if (c === "|") {
+      if (cell === index) return line.slice(start === -1 ? i : start, i);
+      cell++;
+      start = -1;
+      continue;
+    }
+    if (start < 0) start = i;
+  }
+  if (cell === index) return line.slice(start === -1 ? 0 : start);
+  throw new Error(`invalid_index: row has no cell ${index}`);
+}
+function readMeta(metaMap) {
+  const str = (k) => {
+    const v = metaMap.get(k);
+    if (typeof v !== "string") throw new Error(`invalid_index: missing or non-string metadata ${k}`);
+    return v;
+  };
+  const num = (k) => {
+    const v = metaMap.get(k);
+    if (typeof v !== "number" || !Number.isFinite(v)) throw new Error(`invalid_index: missing or non-numeric metadata ${k}`);
+    return v;
+  };
+  return {
+    formatVersion: num("formatVersion"),
+    schemaVersion: num("schemaVersion"),
+    embeddingModel: str("embeddingModel"),
+    embeddingDimension: num("embeddingDimension"),
+    vectorCodec: str("vectorCodec"),
+    createdAt: str("createdAt"),
+    updatedAt: str("updatedAt")
+  };
+}
+function decodeIndexDocument(text) {
+  const root = decodeGeneric(text);
+  if (!(root instanceof Map)) throw new Error("invalid_index: document is not an object");
+  const meta = readMeta(root);
+  if (meta.formatVersion !== INDEX_FORMAT_VERSION) {
+    throw new Error(`invalid_index: unsupported format version ${meta.formatVersion}`);
+  }
+  const filesRaw = root.get("files");
+  if (!Array.isArray(filesRaw)) throw new Error("invalid_index: missing files section");
+  const fileRecords = filesRaw.map((r) => {
+    if (!(r instanceof Map)) throw new Error("invalid_index: file row is not an object");
+    const f = {
+      vaultPath: r.get("vaultPath"),
+      mtime: r.get("mtime"),
+      chunkCount: r.get("chunkCount")
+    };
+    if (typeof f.vaultPath !== "string" || typeof f.mtime !== "number" || typeof f.chunkCount !== "number") {
+      throw new Error("invalid_index: file row has non-scalar cells");
+    }
+    return f;
+  });
+  const chunksRaw = root.get("chunks");
+  if (!Array.isArray(chunksRaw)) throw new Error("invalid_index: missing chunks section");
+  const chunkRecords = chunksRaw.map((r) => {
+    if (!(r instanceof Map)) throw new Error("invalid_index: chunk row is not an object");
+    const c = {
+      id: r.get("id"),
+      vaultPath: r.get("vaultPath"),
+      page: r.get("page"),
+      chunkIndex: r.get("chunkIndex"),
+      sourceType: r.get("sourceType"),
+      text: r.get("text"),
+      embedding: r.get("embedding")
+    };
+    if (typeof c.id !== "string" || typeof c.vaultPath !== "string" || typeof c.page !== "number" || typeof c.chunkIndex !== "number" || typeof c.text !== "string" || typeof c.embedding !== "string") {
+      throw new Error("invalid_index: chunk row has non-scalar cells");
+    }
+    if (c.sourceType !== "pdf" && c.sourceType !== "note") {
+      throw new Error(`invalid_index: unknown sourceType ${JSON.stringify(c.sourceType)}`);
+    }
+    return { ...c, sourceType: c.sourceType, embedding: decodeVector2(c.embedding) };
+  });
+  const trailer = /(?:^|\n)##! summary counts=(\d+),(\d+)\n$/.exec(text);
+  if (!trailer) throw new Error("invalid_index: missing summary trailer (truncated file?)");
+  if (Number(trailer[1]) !== fileRecords.length || Number(trailer[2]) !== chunkRecords.length) {
+    throw new Error("invalid_index: summary counts do not match index tables");
+  }
+  return { meta, fileRecords, chunkRecords };
+}
+
+// src/store/streamGcf.ts
+var fs2 = __toESM(require("fs"));
+var import_stream2 = require("stream");
+var import_string_decoder = require("string_decoder");
+function resolvePhysicalPath(base, vaultPath) {
+  return base.endsWith("/") ? base + vaultPath : base + "/" + vaultPath;
+}
+function openLines(file) {
+  const decoder = new import_string_decoder.StringDecoder("utf8");
+  let pending = "";
+  return fs2.createReadStream(file, { encoding: "utf8" }).pipe(
+    new import_stream2.Transform({
+      readableObjectMode: true,
+      transform(chunk, _enc, cb) {
+        const lines = (pending + decoder.write(chunk)).split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) this.push(line);
+        cb();
+      },
+      flush(cb) {
+        const tail = pending + decoder.end();
+        if (tail !== "") this.push(tail);
+        cb();
+      }
+    })
+  );
+}
+function writeDrained(w) {
+  return new Promise((resolve, reject) => {
+    w.once("drain", resolve);
+    w.once("error", reject);
+  });
+}
+function writeText(w, text) {
+  if (w.write(text)) return Promise.resolve();
+  return writeDrained(w);
+}
+async function appendRows(w, rows, counter) {
+  try {
+    for await (const line of rows) {
+      counter.count++;
+      if (!w.write(line + "\n")) {
+        await writeDrained(w);
+      }
+    }
+  } catch (err) {
+    rows.destroy();
+    throw err;
+  }
+}
+function vaultPathOf(line) {
+  try {
+    const v = parseScalar(extractCell(line, VAULT_PATH_COLUMN), true);
+    return typeof v === "string" ? v : null;
+  } catch {
+    return null;
+  }
+}
+function committedChunkRows(file, skipVaultPaths) {
+  let section = "none";
+  return openLines(file).pipe(
+    new import_stream2.Transform({
+      objectMode: true,
+      transform(line, _enc, cb) {
+        if (line.startsWith("## ")) {
+          section = line.startsWith("## chunks ") ? "chunks" : "other";
+          cb();
+          return;
+        }
+        if (line.startsWith("##!")) {
+          cb();
+          return;
+        }
+        if (section !== "chunks") {
+          cb();
+          return;
+        }
+        const p = vaultPathOf(line);
+        if (p !== null && skipVaultPaths.has(p)) {
+          cb();
+        } else {
+          cb(null, line);
+        }
+      }
+    })
+  );
+}
+function stagedChunkRows(file, upserted, rowStarts) {
+  let section = "none";
+  let rowIdx = 0;
+  return openLines(file).pipe(
+    new import_stream2.Transform({
+      objectMode: true,
+      transform(line, _enc, cb) {
+        if (line.startsWith("## ")) {
+          section = line.startsWith("## upserts ") ? "upserts" : "other";
+          rowIdx = 0;
+          cb();
+          return;
+        }
+        if (line.startsWith("##!")) {
+          cb();
+          return;
+        }
+        if (section !== "upserts") {
+          cb();
+          return;
+        }
+        const idx = rowIdx++;
+        const p = vaultPathOf(line);
+        const start = p !== null ? rowStarts.get(p) : void 0;
+        if (p !== null && upserted.has(p) && idx >= (start ?? 0)) cb(null, line);
+        else cb();
+      }
+    })
+  );
+}
+function parseFileRow(line) {
+  const cells = splitRow(line);
+  if (cells.length !== FILES_FIELDS.length) return null;
+  const vaultPath = parseScalar(cells[0], true);
+  const mtime = parseScalar(cells[1], true);
+  const chunkCount = parseScalar(cells[2], true);
+  if (typeof vaultPath !== "string" || vaultPath === "") return null;
+  if (typeof mtime !== "number" || !Number.isFinite(mtime)) return null;
+  if (typeof chunkCount !== "number" || !Number.isInteger(chunkCount) || chunkCount < 0) return null;
+  return { vaultPath, mtime, chunkCount };
+}
+function validateChunkRow(line, embeddingDimension) {
+  const cells = splitRow(line);
+  if (cells.length !== CHUNKS_FIELDS.length) return false;
+  const id = parseScalar(cells[0], true);
+  const vaultPath = parseScalar(cells[1], true);
+  const page = parseScalar(cells[2], true);
+  const chunkIndex = parseScalar(cells[3], true);
+  const sourceType = parseScalar(cells[4], true);
+  const text = parseScalar(cells[5], true);
+  if (typeof id !== "string" || id === "") return false;
+  if (typeof vaultPath !== "string" || vaultPath === "") return false;
+  if (typeof page !== "number" || typeof chunkIndex !== "number") return false;
+  if (sourceType !== "pdf" && sourceType !== "note") return false;
+  if (typeof text !== "string") return false;
+  if (cells[6] === "") return embeddingDimension === 0;
+  let decoded;
+  try {
+    decoded = decodeVector2(cells[6]);
+  } catch {
+    return false;
+  }
+  return decoded.length === embeddingDimension;
+}
+function expectedSectionFields(headerLine, fields) {
+  const braceStart = headerLine.indexOf("{");
+  const braceEnd = headerLine.indexOf("}", braceStart);
+  if (braceStart < 0 || braceEnd < 0) return false;
+  return headerLine.slice(braceStart + 1, braceEnd).split(",").join(",") === fields.join(",");
+}
+async function scanIndexDocumentStream(file) {
+  const metaMap = /* @__PURE__ */ new Map();
+  const fileRecords = [];
+  let section = "meta";
+  let chunkRowCount = 0;
+  let complete = true;
+  let summaryCounts = null;
+  let sawSummary = false;
+  let dimension = null;
+  for await (const raw of openLines(file)) {
+    const line = raw.replace(/\r$/, "");
+    if (line === "") continue;
+    if (line.startsWith("##! ")) {
+      if (sawSummary) {
+        complete = false;
+        continue;
+      }
+      sawSummary = true;
+      const m = line.match(/^##! summary counts=(\d+),(\d+)$/);
+      if (!m) {
+        complete = false;
+      } else {
+        summaryCounts = [Number(m[1]), Number(m[2])];
+      }
+      continue;
+    }
+    if (line.startsWith("## ")) {
+      const name = line.slice(3, line.indexOf(" ["));
+      if (dimension === null) {
+        try {
+          dimension = readMeta(metaMap).embeddingDimension;
+        } catch {
+          dimension = -1;
+        }
+      }
+      if (name === "files") {
+        if (section === "chunks") complete = false;
+        if (!expectedSectionFields(line, FILES_FIELDS)) complete = false;
+        section = "files";
+      } else if (name === "chunks") {
+        if (section === "chunks") complete = false;
+        if (!expectedSectionFields(line, CHUNKS_FIELDS)) complete = false;
+        section = "chunks";
+      } else {
+        complete = false;
+        section = "other";
+      }
+      continue;
+    }
+    if (section === "meta") {
+      const eq = line.indexOf("=");
+      if (eq <= 0 || metaMap.has(line.slice(0, eq))) {
+        complete = false;
+        continue;
+      }
+      metaMap.set(line.slice(0, eq), parseScalar(line.slice(eq + 1), false));
+      continue;
+    }
+    if (section === "files") {
+      const record = parseFileRow(line);
+      if (record === null) complete = false;
+      else fileRecords.push(record);
+      continue;
+    }
+    if (section === "chunks") {
+      chunkRowCount++;
+      if (dimension === -1 || !validateChunkRow(line, dimension ?? 0)) {
+        complete = false;
+      }
+    }
+  }
+  let meta;
+  try {
+    meta = readMeta(metaMap);
+  } catch {
+    return { meta: { formatVersion: -1, schemaVersion: 0, embeddingModel: "", embeddingDimension: 0, vectorCodec: "", createdAt: "", updatedAt: "" }, fileRecords: [], chunkRowCount: 0, complete: false };
+  }
+  if (meta.formatVersion !== INDEX_FORMAT_VERSION) {
+    return { meta, fileRecords, chunkRowCount, complete: false };
+  }
+  if (!sawSummary || summaryCounts === null || summaryCounts[0] !== fileRecords.length || summaryCounts[1] !== chunkRowCount) {
+    return { meta, fileRecords, chunkRowCount, complete: false };
+  }
+  return { meta, fileRecords, chunkRowCount, complete };
+}
+async function readHeadScalars(file) {
+  const metaMap = /* @__PURE__ */ new Map();
+  try {
+    for await (const raw of openLines(file)) {
+      const line = raw.replace(/\r$/, "");
+      if (line.startsWith("##") || line === "") break;
+      const eq = line.indexOf("=");
+      if (eq <= 0) break;
+      metaMap.set(line.slice(0, eq), parseScalar(line.slice(eq + 1), false));
+    }
+  } catch {
+    return null;
+  }
+  return metaMap;
+}
+async function readTailTrailer(file) {
+  let handle;
+  try {
+    handle = await fs2.promises.open(file, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const { size } = await handle.stat();
+    if (size < 4) return null;
+    const bytes = Math.min(size, 256);
+    const buf = Buffer.allocUnsafe(bytes);
+    await handle.read(buf, 0, bytes, size - bytes);
+    const lines = buf.toString("utf8").split("\n").filter((l) => l !== "");
+    const m = (lines[lines.length - 1] ?? "").match(
+      /^##! summary counts=(\d+),(\d+)$/
+    );
+    return m ? { fileCount: Number(m[1]), chunkCount: Number(m[2]) } : null;
+  } catch {
+    return null;
+  } finally {
+    await handle.close();
+  }
+}
+
+// src/store/VectorStore.ts
 function cosineSimilarity(a, b) {
   let dot = 0, normA = 0, normB = 0;
-  for (let i = 0; i < a.length; i++) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
     dot += a[i] * b[i];
     normA += a[i] * a[i];
     normB += b[i] * b[i];
@@ -1222,102 +4039,516 @@ function cosineSimilarity(a, b) {
   if (normA === 0 || normB === 0) return 0;
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
+var REPLACE_ERR_CODES = { EPERM: true, EACCES: true, EBUSY: true };
 var VectorStore = class {
   constructor(pluginDir, app) {
     this.pluginDir = pluginDir;
     this.app = app;
-    this.loaded = false;
-    this.schemaUpgraded = false;
-    this.indexPath = pluginDir + "/index/index.json";
-    this.data = this.emptyIndex("");
+    this.metaKnown = false;
+    this.files = /* @__PURE__ */ new Map();
+    this.chunks = null;
+    this.loadedModel = null;
+    this.loadedEpoch = -1;
+    this.epoch = 0;
+    this.session = null;
+    this.loadPromise = null;
+    this.indexDir = pluginDir + "/index";
+    this.indexPath = this.indexDir + "/index.gcf";
+    this.tmpPath = this.indexPath + ".tmp";
+    this.asidePath = this.indexPath + ".swap";
+    this.stagingPath = this.indexDir + "/.staging.gcf";
+    this.meta = emptyMeta("");
   }
-  emptyIndex(embeddingModel) {
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    return {
-      schemaVersion: CURRENT_SCHEMA_VERSION,
-      embeddingModel,
-      embeddingDimension: 0,
-      createdAt: now,
-      updatedAt: now,
-      files: {},
-      chunks: []
-    };
-  }
+  // ── Query path (lazy load) ────────────────────────────────────────────────
+  /**
+   * Load the committed index (metadata, file table, chunks, vectors) on demand.
+   * No-op when a current cache for `embeddingModel` exists. Throws
+   * ProviderError DIMENSION_MISMATCH when the committed index was built with a
+   * different model. Works while an indexing session is open (loads the last
+   * published snapshot, which is never taken offline during indexing).
+   */
   async ensureLoaded(embeddingModel) {
-    if (this.loaded) return;
-    const exists = await this.app.vault.adapter.exists(this.indexPath);
-    if (!exists) {
-      this.data = this.emptyIndex(embeddingModel);
-      this.loaded = true;
+    if (this.chunks !== null && this.loadedEpoch === this.epoch && this.loadedModel === embeddingModel) return;
+    const pending = this.loadPromise;
+    if (pending) {
+      await pending;
+      if (this.chunks !== null && this.loadedEpoch === this.epoch && this.loadedModel === embeddingModel) return;
+    }
+    const p = this.doLoad(embeddingModel).finally(() => {
+      this.loadPromise = null;
+    });
+    this.loadPromise = p;
+    await p;
+  }
+  async doLoad(model, attempt = 0) {
+    const adapter = this.app.vault.adapter;
+    const startEpoch = this.epoch;
+    const hadSession = this.session !== null;
+    let committed = null;
+    let unreadable = false;
+    if (await adapter.exists(this.indexPath)) {
+      try {
+        committed = decodeIndexDocument(await adapter.read(this.indexPath));
+      } catch {
+        unreadable = true;
+      }
+    }
+    if (this.epoch !== startEpoch || this.session !== null !== hadSession) {
+      if (attempt < 3) return this.doLoad(model, attempt + 1);
+    }
+    if (unreadable) {
+      this.metaKnown = true;
+      if (!this.session) {
+        this.meta = emptyMeta(model);
+        this.files = /* @__PURE__ */ new Map();
+      }
+      this.chunks = [];
+      this.loadedModel = model;
+      this.loadedEpoch = this.epoch;
       return;
     }
-    const raw = await this.app.vault.adapter.read(this.indexPath);
-    const parsed = JSON.parse(raw);
-    if (parsed.schemaVersion !== CURRENT_SCHEMA_VERSION) {
-      this.schemaUpgraded = true;
-      this.data = this.emptyIndex(embeddingModel);
-      this.loaded = true;
+    if (committed === null) {
+      this.metaKnown = true;
+      if (!this.session) {
+        this.meta = emptyMeta(model);
+        this.files = /* @__PURE__ */ new Map();
+      }
+      this.chunks = [];
+      this.loadedModel = model;
+      this.loadedEpoch = this.epoch;
       return;
     }
-    if (parsed.embeddingModel === "") {
-      parsed.embeddingModel = embeddingModel;
-    } else if (parsed.embeddingModel !== embeddingModel) {
+    const c = committed;
+    const committedModel = c.meta.embeddingModel;
+    if (committedModel !== "" && committedModel !== model) {
       throw new ProviderError(
-        `Embedding model changed from '${parsed.embeddingModel}' to '${embeddingModel}'. Re-index required.`,
+        `Embedding model changed from '${committedModel}' to '${model}'. Re-index required.`,
         "DIMENSION_MISMATCH"
       );
     }
-    this.data = parsed;
-    this.loaded = true;
-  }
-  async save() {
-    this.data.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-    await this.app.vault.adapter.mkdir(this.pluginDir + "/index");
-    await this.app.vault.adapter.write(this.indexPath, JSON.stringify(this.data, null, 2));
-  }
-  upsertFile(vaultPath, mtime, chunks) {
-    this.data.chunks = this.data.chunks.filter((c) => c.vaultPath !== vaultPath);
-    this.data.chunks.push(...chunks);
-    if (this.data.embeddingDimension === 0 && chunks.length > 0 && chunks[0].embedding.length > 0) {
-      this.data.embeddingDimension = chunks[0].embedding.length;
+    this.metaKnown = true;
+    if (!this.session) {
+      this.meta = c.meta;
+      this.meta.embeddingModel = committedModel === "" ? model : committedModel;
+      this.files = new Map(c.fileRecords.map((f) => [f.vaultPath, f]));
     }
-    const entry = {
-      vaultPath,
-      mtime,
-      chunkIds: chunks.map((c) => c.id)
-    };
-    this.data.files[vaultPath] = entry;
+    this.chunks = c.chunkRecords;
+    this.loadedModel = committedModel === "" ? model : committedModel;
+    this.loadedEpoch = this.epoch;
   }
-  removeFile(vaultPath) {
-    this.data.chunks = this.data.chunks.filter((c) => c.vaultPath !== vaultPath);
-    delete this.data.files[vaultPath];
+  /** Drop query chunk/vector memory. Lightweight stats/mtimes are retained. */
+  unload() {
+    this.chunks = null;
+    this.loadedModel = null;
+    this.loadedEpoch = -1;
+    this.epoch++;
   }
-  getFileMtime(vaultPath) {
-    return this.data.files[vaultPath]?.mtime ?? null;
+  /** True when a current (post-publication) query cache is resident. */
+  isLoaded() {
+    return this.chunks !== null && this.loadedEpoch === this.epoch && this.loadedModel !== null;
   }
   query(queryEmbedding, topK) {
-    if (this.data.chunks.length === 0) return [];
-    const scored = this.data.chunks.map((chunk) => ({
+    if (!this.chunks || this.chunks.length === 0) return [];
+    const q = Float64Array.from(queryEmbedding);
+    const scored = this.chunks.map((chunk) => ({
       chunk,
-      score: cosineSimilarity(queryEmbedding, chunk.embedding)
+      score: cosineSimilarity(q, chunk.embedding)
     }));
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, topK);
+    return scored.slice(0, topK).map((r) => ({
+      score: r.score,
+      chunk: {
+        id: r.chunk.id,
+        text: r.chunk.text,
+        embedding: Array.from(r.chunk.embedding),
+        sourceType: r.chunk.sourceType,
+        vaultPath: r.chunk.vaultPath,
+        page: r.chunk.page,
+        chunkIndex: r.chunk.chunkIndex
+      }
+    }));
   }
+  // ── Indexing session (disk-backed) ────────────────────────────────────────
+  /**
+   * Open a disk-backed indexing session for `embeddingModel`: unloads the query
+   * vector cache, loads only metadata + file table from the committed GCF,
+   * and opens the staging file. Vector data stays on disk for the whole run.
+   * A model change resets
+   * the file table so every file is re-embedded (the old-model vectors are
+   * dropped at publication).
+   */
+  async prepareForIndexing(embeddingModel) {
+    if (this.session) return;
+    if (this.physicalBase() === null) {
+      throw new Error("GCF index requires a desktop vault adapter (physical file paths)");
+    }
+    const adapter = this.app.vault.adapter;
+    await adapter.mkdir(this.indexDir);
+    await this.recoverCrashedSwap();
+    await this.removeIfExists(this.tmpPath);
+    await this.removeIfExists(this.stagingPath);
+    let committedMeta = null;
+    let committedFiles = [];
+    let baseReadable = true;
+    const hasGcf = await adapter.exists(this.indexPath);
+    if (hasGcf) {
+      const physical = resolvePhysicalPath(this.physicalBase(), this.indexPath);
+      let scanned = null;
+      try {
+        scanned = await scanIndexDocumentStream(physical);
+      } catch {
+      }
+      if (scanned !== null && scanned.complete && scanned.meta.formatVersion === INDEX_FORMAT_VERSION) {
+        committedMeta = scanned.meta;
+        committedFiles = scanned.fileRecords;
+      } else {
+        baseReadable = false;
+      }
+    }
+    const baseMeta = committedMeta ?? emptyMeta(embeddingModel);
+    const committedModel = committedMeta?.embeddingModel ?? "";
+    const model = embeddingModel !== "" ? embeddingModel : committedModel;
+    const replaceAll = model !== "" && committedModel !== "" && committedModel !== model;
+    this.metaKnown = true;
+    this.meta = { ...baseMeta, embeddingModel: model };
+    this.files = new Map((replaceAll ? [] : committedFiles).map((f) => [f.vaultPath, f]));
+    this.chunks = null;
+    this.loadedModel = null;
+    this.loadedEpoch = -1;
+    const session = {
+      model,
+      replaceAll,
+      baseReadable,
+      upserted: /* @__PURE__ */ new Set(),
+      removed: /* @__PURE__ */ new Set(),
+      rowStart: /* @__PURE__ */ new Map(),
+      stagedRowCount: 0,
+      closing: false,
+      encoder: void 0,
+      // assigned below, before first write
+      appendChain: Promise.resolve()
+    };
+    this.session = session;
+    session.encoder = new GenericStreamEncoder({ write: (s) => this.stageAppend(s) });
+    session.encoder.beginArray("upserts", [...CHUNKS_FIELDS]);
+    await this.flushStaging();
+  }
+  /** Stage one file's chunk rows; the file counts as upserted only after the append is confirmed. */
+  async upsertFile(vaultPath, mtime, chunks) {
+    const session = this.session;
+    if (!session || session.closing) {
+      throw new Error("upsertFile requires an active indexing session (call prepareForIndexing first; none is open while a publication is in flight)");
+    }
+    session.rowStart.set(vaultPath, session.stagedRowCount);
+    for (const c of chunks) {
+      session.encoder.writeRow([c.id, c.vaultPath, c.page, c.chunkIndex, c.sourceType, c.text, encodeVector(c.embedding)]);
+    }
+    await this.flushStaging();
+    session.upserted.add(vaultPath);
+    session.removed.delete(vaultPath);
+    session.stagedRowCount += chunks.length;
+    if (this.meta.embeddingDimension === 0 && chunks.length > 0 && chunks[0].embedding.length > 0) {
+      this.meta.embeddingDimension = chunks[0].embedding.length;
+    }
+    this.files.set(vaultPath, { vaultPath, mtime, chunkCount: chunks.length });
+  }
+  /**
+   * Remove a file's entries. Works with the query DB unloaded (disk-backed).
+   * No-op when the path has no entries. Self-contained when no session is
+   * open (opens and publishes one); applies to the open session otherwise.
+   */
+  async removeFile(vaultPath) {
+    const hadSession = this.session !== null;
+    if (!hadSession) {
+      await this.prepareForIndexing(this.meta.embeddingModel || "");
+    }
+    const session = this.session;
+    if (this.files.has(vaultPath) || session.upserted.has(vaultPath)) {
+      session.removed.add(vaultPath);
+      session.upserted.delete(vaultPath);
+      this.files.delete(vaultPath);
+    }
+    if (!hadSession) await this.finishIndexing();
+  }
+  stageAppend(s) {
+    const session = this.session;
+    if (!session) return;
+    session.appendChain = session.appendChain.then(() => this.app.vault.adapter.append(this.stagingPath, s));
+  }
+  async flushStaging() {
+    const session = this.session;
+    if (!session) return;
+    await session.appendChain;
+  }
+  /**
+   * Install the tmp document as the committed index. A direct `fs.rename`
+   * replaces an existing file in one step on POSIX, which is the atomic
+   * publication this design needs. Obsidian's `adapter.rename` refuses to
+   * overwrite on every platform ("Destination file already exists!"), and
+   * on Windows `fs.rename` cannot replace an existing destination either —
+   * in that case fall back to a two-step swap through the aside file:
+   * commit aside -> new in place -> aside removed. If the swap itself fails,
+   * the previous committed document is restored, so a failed publish never
+   * leaves the index missing. A crash inside the swap window is repaired by
+   * `recoverCrashedSwap` before the index is trusted again.
+   */
+  async publishSwap() {
+    const physical = this.physicalBase();
+    const tmp = resolvePhysicalPath(physical, this.tmpPath);
+    const index = resolvePhysicalPath(physical, this.indexPath);
+    try {
+      await fs3.promises.rename(tmp, index);
+      return;
+    } catch (err) {
+      const code = err.code;
+      if (!code || !REPLACE_ERR_CODES[code]) throw err;
+    }
+    const aside = resolvePhysicalPath(physical, this.asidePath);
+    try {
+      await fs3.promises.rename(index, aside);
+      await fs3.promises.rename(tmp, index);
+      await fs3.promises.rm(aside, { force: true });
+    } catch (swapErr) {
+      try {
+        if (fs3.existsSync(aside)) await fs3.promises.rename(aside, index);
+      } catch {
+      }
+      throw swapErr;
+    }
+  }
+  /**
+   * Repair the state a crash inside the Windows two-step swap can leave:
+   * committed missing + fully-written new document in tmp -> commit the new
+   * one; committed missing + previous document set aside -> restore it;
+   * committed present -> the aside is a stale duplicate, discard it.
+   */
+  async recoverCrashedSwap() {
+    const physical = this.physicalBase();
+    const index = resolvePhysicalPath(physical, this.indexPath);
+    const tmp = resolvePhysicalPath(physical, this.tmpPath);
+    const aside = resolvePhysicalPath(physical, this.asidePath);
+    if (!fs3.existsSync(aside)) return;
+    let hasIndex = false;
+    let hasTmp = false;
+    try {
+      hasIndex = fs3.existsSync(index);
+      hasTmp = fs3.existsSync(tmp);
+    } catch {
+      return;
+    }
+    if (hasIndex) {
+      await fs3.promises.rm(aside, { force: true });
+    } else if (hasTmp) {
+      await fs3.promises.rename(tmp, index);
+      await fs3.promises.rm(aside, { force: true });
+    } else {
+      await fs3.promises.rename(aside, index);
+    }
+  }
+  /**
+   * Publish the committed index + staged updates atomically (tmp write +
+   * rename) and close the session. Unaffected chunk rows are STREAMED
+   * verbatim from the committed document (line by line, pipe backpressure,
+   * no vector decoding, no whole-document materialization); staged rows are
+   * filtered to confirmed upserts. The session stays installed through the
+   * async publication so a concurrent query cannot overwrite the staged file
+   * table, and upserts are rejected while it runs. On any failure the
+   * committed index, if it existed, is unchanged (staging is discarded; a
+   * partial re-index simply re-runs on demand).
+   */
+  async finishIndexing() {
+    const session = this.session;
+    if (!session) return;
+    const publishedMeta = { ...this.meta, updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    const fileRecords = [...this.files.values()].sort(
+      (a, b) => a.vaultPath < b.vaultPath ? -1 : a.vaultPath > b.vaultPath ? 1 : 0
+    );
+    const affected = /* @__PURE__ */ new Set([...session.upserted, ...session.removed]);
+    const upserted = session.upserted;
+    session.closing = true;
+    const adapter = this.app.vault.adapter;
+    const physical = this.physicalBase();
+    try {
+      session.encoder.close();
+      await this.flushStaging();
+      const hasCommitted = await adapter.exists(this.indexPath);
+      const noOp = !session.replaceAll && session.upserted.size === 0 && session.removed.size === 0 && hasCommitted;
+      if (!noOp) {
+        const tmpFile = resolvePhysicalPath(physical, this.tmpPath);
+        const out = fs3.createWriteStream(tmpFile, { encoding: "utf8" });
+        const outFailed = new Promise((res) => {
+          out.once("error", res);
+        });
+        const sources = [];
+        const write = async () => {
+          try {
+            await writeText(out, documentHeader(publishedMeta));
+            await writeText(out, `${FILES_SECTION_HEADER}
+`);
+            for (const f of fileRecords) {
+              await writeText(out, encodeFileRow(f) + "\n");
+            }
+            await writeText(out, `${CHUNKS_SECTION_HEADER}
+`);
+            const retained = { count: 0 };
+            if (hasCommitted && session.baseReadable && !session.replaceAll) {
+              const committedFile = resolvePhysicalPath(physical, this.indexPath);
+              const committedRows = committedChunkRows(committedFile, affected);
+              sources.push(committedRows);
+              await appendRows(out, committedRows, retained);
+            }
+            const staged = { count: 0 };
+            if (await adapter.exists(this.stagingPath)) {
+              const stagingFile = resolvePhysicalPath(physical, this.stagingPath);
+              const stagedRows = stagedChunkRows(stagingFile, upserted, session.rowStart);
+              sources.push(stagedRows);
+              await appendRows(out, stagedRows, staged);
+            }
+            await writeText(out, `##! summary counts=${fileRecords.length},${retained.count + staged.count}
+`);
+            await new Promise((resolve, reject) => {
+              out.once("error", reject);
+              out.end(() => resolve());
+            });
+          } catch (err) {
+            out.destroy();
+            throw err;
+          }
+        };
+        try {
+          await Promise.race([write(), outFailed.then((e) => {
+            throw e;
+          })]);
+        } catch (err) {
+          for (const s of sources) s.destroy();
+          out.destroy();
+          throw err;
+        }
+        await this.publishSwap();
+        this.epoch++;
+        if (this.loadedEpoch !== this.epoch) {
+          this.chunks = null;
+          this.loadedModel = null;
+          this.loadedEpoch = -1;
+        }
+      }
+    } finally {
+      this.session = null;
+      await this.removeIfExists(this.stagingPath);
+      await this.removeIfExists(this.tmpPath);
+    }
+  }
+  /**
+   * Persist current in-flight work. Indexing runs publish exactly once, in
+   * `finishIndexing`; this is a no-op when no session is open (the committed
+   * index is already current).
+   */
+  async save() {
+    if (this.session) await this.finishIndexing();
+  }
+  /**
+   * Delete the entire index: discards any open session's staged work and
+   * atomically publishes an empty index document.
+   */
   async clear(embeddingModel) {
-    this.data = this.emptyIndex(embeddingModel);
-    await this.save();
+    if (this.session) {
+      this.session = null;
+      await this.removeIfExists(this.stagingPath);
+    }
+    const adapter = this.app.vault.adapter;
+    await adapter.mkdir(this.indexDir);
+    const meta = emptyMeta(embeddingModel);
+    await adapter.write(this.tmpPath, encodeIndexDocument(meta, [], []));
+    await this.publishSwap();
+    this.epoch++;
+    this.meta = meta;
+    this.metaKnown = true;
+    this.files = /* @__PURE__ */ new Map();
+    this.chunks = [];
+    this.loadedModel = embeddingModel;
+    this.loadedEpoch = this.epoch;
   }
+  // ── Lightweight state (valid while the query DB is unloaded) ──────────────
   async exists() {
     return this.app.vault.adapter.exists(this.indexPath);
   }
+  /**
+   * Returns null when there is no readable GCF index.
+   */
+  async peekModel() {
+    if (!this.metaKnown) {
+      if (await this.app.vault.adapter.exists(this.indexPath)) {
+        const base = this.physicalBase();
+        if (base === null) return null;
+        const head = await readHeadScalars(resolvePhysicalPath(base, this.indexPath));
+        if (head) {
+          try {
+            const meta = readMeta(head);
+            if (meta.formatVersion === INDEX_FORMAT_VERSION) {
+              this.meta = meta;
+              this.metaKnown = true;
+            }
+          } catch {
+          }
+        }
+      }
+    }
+    return this.metaKnown && this.meta.embeddingModel !== "" ? this.meta.embeddingModel : null;
+  }
+  /**
+   * Lightweight stats for display (settings status) without loading the
+   * query DB: uses the in-memory file table when hydrated, otherwise reads
+   * the document's header scalars + summary trailer (bounded reads).
+   * Returns null when there is no committed GCF index on disk.
+   */
+  async peekStats() {
+    if (!this.metaKnown) await this.peekModel();
+    if (!this.metaKnown) return null;
+    const stats = this.getStats();
+    if (stats.fileCount > 0 || this.session !== null) return stats;
+    const base = this.physicalBase();
+    if (base === null) return stats;
+    const trailer = await readTailTrailer(resolvePhysicalPath(base, this.indexPath));
+    if (trailer === null) return stats;
+    return { ...stats, fileCount: trailer.fileCount, chunkCount: trailer.chunkCount };
+  }
+  getFileMtime(vaultPath) {
+    return this.files.get(vaultPath)?.mtime ?? null;
+  }
+  getIndexedPaths() {
+    return [...this.files.keys()];
+  }
   getStats() {
+    let chunkCount = 0;
+    if (this.chunks) {
+      chunkCount = this.chunks.length;
+    } else {
+      for (const f of this.files.values()) chunkCount += f.chunkCount;
+    }
     return {
-      fileCount: Object.keys(this.data.files).length,
-      chunkCount: this.data.chunks.length,
-      embeddingModel: this.data.embeddingModel,
-      updatedAt: this.data.updatedAt
+      fileCount: this.files.size,
+      chunkCount,
+      embeddingModel: this.meta.embeddingModel,
+      updatedAt: this.meta.updatedAt
     };
+  }
+  async removeIfExists(path2) {
+    if (await this.app.vault.adapter.exists(path2)) {
+      try {
+        await this.app.vault.adapter.remove(path2);
+      } catch {
+      }
+    }
+  }
+  /**
+   * Physical base directory of the vault (desktop `FileSystemAdapter`
+   * exposes `getBasePath`), or null on adapters without physical paths.
+   * Row streaming requires a physical file; a null base means this adapter
+   * cannot back the streaming index.
+   */
+  physicalBase() {
+    const adapter = this.app.vault.adapter;
+    return typeof adapter.getBasePath === "function" ? adapter.getBasePath() : null;
   }
 };
 
@@ -1406,20 +4637,73 @@ var ChunkingService = class {
 var EmbeddingService = class {
   constructor(provider) {
     this.provider = provider;
+    /** Embed calls currently in flight — dispose must not tear the model down mid-inference. */
+    this.inFlight = 0;
+    /** Explicit "keep the model alive" scopes (e.g. a full index run holding the worker across files). */
+    this.sessionCount = 0;
+    /** Single-flight guard: concurrent dispose() calls share one provider.dispose() invocation. */
+    this.disposePromise = null;
   }
   async embedBatch(texts, batchSize = 20) {
     if (texts.length === 0) return [];
     const allEmbeddings = [];
     for (let i = 0; i < texts.length; i += batchSize) {
       const batch = texts.slice(i, i + batchSize);
-      const result = await this.provider.embed(batch);
+      const result = await this.callEmbed(batch);
       allEmbeddings.push(...result.embeddings);
     }
     return allEmbeddings;
   }
   async embedQuery(text) {
-    const result = await this.provider.embed([text]);
+    const result = await this.callEmbed([text]);
     return result.embeddings[0];
+  }
+  /**
+   * Hold the model across a sequence of embedding calls so dispose() does
+   * not tear it down between files. Pairs with endSession().
+   */
+  beginSession() {
+    this.sessionCount++;
+  }
+  endSession() {
+    if (this.sessionCount > 0) this.sessionCount--;
+  }
+  /**
+   * Release the underlying model / inference process when idle.
+   * No-op while an embed is in flight or a session is held; single-flight,
+   * and safe to call repeatedly (a provider reloads lazily on next use).
+   */
+  dispose() {
+    if (this.inFlight > 0 || this.sessionCount > 0) return Promise.resolve();
+    if (this.disposePromise) return this.disposePromise;
+    const base = this.provider.dispose ? this.provider.dispose() : Promise.resolve();
+    this.disposePromise = base.finally(() => {
+      this.disposePromise = null;
+    });
+    return this.disposePromise;
+  }
+  /**
+   * Unconditional release for plugin unload. Bypasses the in-flight/session
+   * guards and invokes provider.dispose() immediately; the provider is
+   * contractually cancel-safe and bounded (kills its worker rather than
+   * waiting for a hung inference). Single-flights with dispose(), so a
+   * normal release already running is reused, never doubled.
+   */
+  forceDispose() {
+    if (this.disposePromise) return this.disposePromise;
+    const base = this.provider.dispose ? this.provider.dispose() : Promise.resolve();
+    this.disposePromise = base.finally(() => {
+      this.disposePromise = null;
+    });
+    return this.disposePromise;
+  }
+  async callEmbed(texts) {
+    this.inFlight++;
+    try {
+      return await this.provider.embed(texts);
+    } finally {
+      this.inFlight--;
+    }
   }
 };
 
@@ -1567,7 +4851,7 @@ var PDFIndexer = class {
         c.embedding = embeddings[i];
       });
     }
-    this.vectorStore.upsertFile(file.path, file.stat.mtime, allChunks);
+    await this.vectorStore.upsertFile(file.path, file.stat.mtime, allChunks);
     return {
       vaultPath: file.path,
       skipped: false,
@@ -1677,7 +4961,7 @@ var NoteIndexer = class {
     const raw = await this.app.vault.read(file);
     const withoutFrontmatter = raw.replace(/^---[\s\S]*?---\n?/, "").trim();
     if (!withoutFrontmatter) {
-      this.vectorStore.upsertFile(file.path, file.stat.mtime, []);
+      await this.vectorStore.upsertFile(file.path, file.stat.mtime, []);
       return { vaultPath: file.path, skipped: false, chunkCount: 0, pageCount: 0 };
     }
     const chunkTexts = chunkMarkdownBySections(
@@ -1702,7 +4986,7 @@ var NoteIndexer = class {
         c.embedding = embeddings[i];
       });
     }
-    this.vectorStore.upsertFile(file.path, file.stat.mtime, chunks);
+    await this.vectorStore.upsertFile(file.path, file.stat.mtime, chunks);
     return { vaultPath: file.path, skipped: false, chunkCount: chunks.length, pageCount: 0 };
   }
 };
@@ -1725,44 +5009,48 @@ var IndexManager = class {
     return files.filter((f) => f.extension === "pdf" || f.extension === "md");
   }
   async indexAll(settings, onProgress, signal) {
-    await this.vectorStore.ensureLoaded(settings.embeddingModel);
+    await this.vectorStore.prepareForIndexing(settings.embeddingModel);
     const files = this.getFilesToIndex(settings.indexScope);
     const result = { indexed: 0, skipped: 0, failed: 0, warnings: [] };
-    let saveCounter = 0;
-    for (let i = 0; i < files.length; i++) {
-      if (signal?.aborted) break;
-      const file = files[i];
-      onProgress?.(i + 1, files.length, file.name);
-      try {
-        let fileResult;
-        if (file.extension === "pdf") {
-          fileResult = await this.pdfIndexer.indexFile(file, settings, void 0, signal);
-        } else {
-          fileResult = await this.noteIndexer.indexFile(file, settings, signal);
+    try {
+      const vaultPaths = new Set(this.app.vault.getFiles().map((f) => f.path));
+      for (const p of this.vectorStore.getIndexedPaths()) {
+        if (!vaultPaths.has(p)) {
+          await this.vectorStore.removeFile(p);
         }
-        if (fileResult.skipped) {
-          result.skipped++;
-        } else {
-          result.indexed++;
-          if (fileResult.warningScannedPdf) {
-            result.warnings.push(`'${file.name}' may be scanned \u2014 no text layer found on most pages.`);
+      }
+      for (let i = 0; i < files.length; i++) {
+        if (signal?.aborted) break;
+        const file = files[i];
+        onProgress?.(i + 1, files.length, file.name);
+        try {
+          let fileResult;
+          if (file.extension === "pdf") {
+            fileResult = await this.pdfIndexer.indexFile(file, settings, void 0, signal);
+          } else {
+            fileResult = await this.noteIndexer.indexFile(file, settings, signal);
           }
+          if (fileResult.skipped) {
+            result.skipped++;
+          } else {
+            result.indexed++;
+            if (fileResult.warningScannedPdf) {
+              result.warnings.push(`'${file.name}' may be scanned \u2014 no text layer found on most pages.`);
+            }
+          }
+        } catch (err) {
+          if (err.message === "Indexing aborted") break;
+          console.error(`Failed to index ${file.path}:`, err);
+          result.failed++;
         }
-      } catch (err) {
-        if (err.message === "Indexing aborted") break;
-        console.error(`Failed to index ${file.path}:`, err);
-        result.failed++;
       }
-      saveCounter++;
-      if (saveCounter % 10 === 0) {
-        await this.vectorStore.save();
-      }
+    } finally {
+      await this.vectorStore.finishIndexing();
     }
-    await this.vectorStore.save();
     return result;
   }
   async indexCurrentFile(file, settings) {
-    await this.vectorStore.ensureLoaded(settings.embeddingModel);
+    await this.vectorStore.prepareForIndexing(settings.embeddingModel);
     const result = { indexed: 0, skipped: 0, failed: 0, warnings: [] };
     try {
       let fileResult;
@@ -1776,13 +5064,435 @@ var IndexManager = class {
       if (fileResult.warningScannedPdf) result.warnings.push(`'${file.name}' may be scanned.`);
     } catch (err) {
       result.failed++;
+    } finally {
+      await this.vectorStore.finishIndexing();
     }
-    await this.vectorStore.save();
     return result;
   }
   async removeFile(vaultPath) {
-    this.vectorStore.removeFile(vaultPath);
-    await this.vectorStore.save();
+    await this.vectorStore.removeFile(vaultPath);
+  }
+};
+
+// src/indexScheduler.ts
+var DEFAULT_QUIET_MS = 3 * 60 * 1e3;
+var IndexScheduler = class {
+  constructor(deps) {
+    this.deps = deps;
+    this.queue = Promise.resolve();
+    this.activeChats = 0;
+    this.lastActivity = 0;
+    this.lastChatEnd = 0;
+    /** Vault paths changed since the last pass (coalesced; deletions remove them). */
+    this.pendingChanged = /* @__PURE__ */ new Set();
+    /** Vault paths deleted/renamed away, processed after vault+chat quiet (never mid-chat). */
+    this.pendingRemovals = /* @__PURE__ */ new Set();
+    /** A full index pass was requested (manual click, startup, or preemption resume). */
+    this.pendingPass = false;
+    /** A full pass is enqueued but has not started yet (display-only; pendingPass covers quiet-gated waits). */
+    this.passQueued = false;
+    /** An explicit index clear (settings) is waiting for the quiet window. */
+    this.pendingClear = false;
+    /** Waiters for deferred clearIndex() calls — resolved when the clear runs. */
+    this.clearWaiters = [];
+    this.runController = null;
+    this.indexing = false;
+    this.runAbortedForChat = false;
+    this.runCancelled = false;
+    /** Runs not yet started stop at their start while a chat is active. */
+    this.stopQueuedRuns = false;
+    this.disposed = false;
+    /** The most recent COMPLETED run (aborted runs are not recorded). */
+    this.lastRun = null;
+    this.quietMs = deps.quietMs ?? DEFAULT_QUIET_MS;
+  }
+  get isIndexing() {
+    return this.indexing;
+  }
+  /** Queue snapshot for display (settings status). */
+  getStatus() {
+    return {
+      indexing: this.indexing,
+      queued: {
+        changes: this.pendingChanged.size,
+        removals: this.pendingRemovals.size,
+        fullPass: this.pendingPass || this.passQueued,
+        clear: this.pendingClear
+      },
+      lastRun: this.lastRun
+    };
+  }
+  /**
+   * Chat activity lease. Preempts any in-flight index pass at a file boundary
+   * and waits for all DB-writing work already in flight or queued to settle,
+   * so the index is stable and queryable when this resolves. Beginning and
+   * ending a chat both count as "activity" for the quiet window.
+   */
+  async acquireChatLease() {
+    this.activeChats++;
+    this.noteActivity();
+    this.stopQueuedRuns = true;
+    if (this.indexing) {
+      this.runAbortedForChat = true;
+      this.runController?.abort();
+    }
+    await this.queue;
+    let ended = false;
+    return {
+      end: () => {
+        if (ended) return;
+        ended = true;
+        this.activeChats = Math.max(0, this.activeChats - 1);
+        this.lastChatEnd = Date.now();
+        if (this.runAbortedForChat) {
+          this.runAbortedForChat = false;
+          this.pendingPass = true;
+        }
+        this.noteActivity();
+      }
+    };
+  }
+  // ---- vault events -------------------------------------------------------
+  onVaultModify(file) {
+    if (this.disposed) return;
+    if (file.extension !== "md" && file.extension !== "pdf") return;
+    this.pendingRemovals.delete(file.path);
+    this.pendingChanged.add(file.path);
+    this.noteActivity();
+  }
+  onVaultDelete(file) {
+    if (this.disposed) return;
+    this.pendingChanged.delete(file.path);
+    this.pendingRemovals.add(file.path);
+    this.noteActivity();
+  }
+  onVaultRename(file, oldPath) {
+    if (this.disposed) return;
+    const f = file;
+    this.pendingChanged.delete(oldPath);
+    this.pendingRemovals.add(oldPath);
+    if (f.extension === "md" || f.extension === "pdf") this.pendingChanged.add(f.path);
+    this.noteActivity();
+  }
+  // ---- manual triggers ----------------------------------------------------
+  /** Full index pass — command palette "Index all files" / settings Re-index. */
+  requestManualIndex() {
+    if (this.disposed) return;
+    if (this.chatGated()) {
+      this.deps.notify(
+        "RAG: Chat is active or recent \u2014 indexing will start automatically once it settles.",
+        5e3
+      );
+      this.pendingPass = true;
+      return;
+    }
+    if (this.indexing) {
+      this.deps.notify(
+        "RAG: Indexing already in progress \u2014 another pass will run when it finishes.",
+        3e3
+      );
+    }
+    this.passQueued = true;
+    this.enqueue(() => this.runPass("manual"));
+  }
+  /** Single file — command palette "Index current file". */
+  indexFile(file) {
+    if (this.disposed) return;
+    if (file.extension !== "md" && file.extension !== "pdf") return;
+    if (this.chatGated()) {
+      this.deps.notify(
+        "RAG: Chat is active or recent \u2014 the file will be indexed once it settles.",
+        5e3
+      );
+      this.pendingPass = true;
+      return;
+    }
+    if (this.indexing) {
+      this.deps.notify(
+        "RAG: Indexing in progress \u2014 the file will be indexed after the current pass.",
+        3e3
+      );
+    }
+    const path2 = file.path;
+    void this.enqueue(() => this.runFile(path2)).catch(
+      (err) => console.error("RAG: File index error:", err)
+    );
+  }
+  /** User-initiated cancel of the current run. True if a run was in progress. */
+  cancelIndex() {
+    if (!this.indexing) return false;
+    this.runCancelled = true;
+    this.runController?.abort();
+    return true;
+  }
+  /**
+   * Clear the index (settings). Deferred while chat is active or recent —
+   * clearing unloads the query DB, which must never overlap a chat. The
+   * returned promise resolves once the clear has actually run.
+   */
+  clearIndex() {
+    if (this.disposed) return Promise.resolve();
+    if (this.chatGated()) {
+      this.pendingClear = true;
+      this.deps.notify(
+        "RAG: Index clear queued \u2014 it will run once chat settles.",
+        5e3
+      );
+      return new Promise((resolve) => this.clearWaiters.push(resolve));
+    }
+    return this.enqueue(
+      () => this.deps.vectorStore.clear(this.deps.getSettings().embeddingModel)
+    );
+  }
+  /** Startup hook: run a pass once the quiet window elapses (auto-index only). */
+  markStartup() {
+    if (this.disposed) return;
+    if (!this.deps.getSettings().autoIndexOnStartup) return;
+    this.pendingPass = true;
+    this.noteActivity();
+  }
+  /** Plugin unload: stop pending work and force-release the embedder. */
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    clearTimeout(this.quietTimer);
+    this.quietTimer = void 0;
+    this.pendingChanged.clear();
+    this.pendingRemovals.clear();
+    this.pendingPass = false;
+    this.pendingClear = false;
+    this.clearWaiters.splice(0).forEach((w) => w());
+    this.runController?.abort();
+    void this.deps.embeddingService.forceDispose().catch((err) => console.error("RAG: Embedder dispose failed:", err));
+  }
+  // ---- internals ----------------------------------------------------------
+  noteActivity() {
+    if (this.disposed) return;
+    this.lastActivity = Date.now();
+    clearTimeout(this.quietTimer);
+    this.quietTimer = setTimeout(() => {
+      this.quietTimer = void 0;
+      this.maybeRunPass();
+    }, this.quietMs);
+  }
+  /**
+   * Quiet window elapsed (or a run just finished): run any queued work.
+   * Removals and an explicit clear are disk-backed; the index pass embeds.
+   * Nothing here runs while a chat is active — the window includes chat activity.
+   */
+  maybeRunPass() {
+    if (this.disposed || this.indexing || this.activeChats > 0) return;
+    if (Date.now() - this.lastActivity < this.quietMs) return;
+    if (this.pendingRemovals.size === 0 && !this.pendingPass && this.pendingChanged.size === 0 && !this.pendingClear) {
+      return;
+    }
+    const manual = this.pendingPass;
+    const hadChanged = this.pendingChanged.size > 0;
+    this.pendingPass = false;
+    this.pendingChanged.clear();
+    if (this.pendingRemovals.size > 0) {
+      void this.enqueue(() => this.runRemovals()).catch(
+        (err) => console.error("RAG: Remove file error:", err)
+      );
+    }
+    if (this.pendingClear) {
+      this.pendingClear = false;
+      const waiters = this.clearWaiters;
+      this.clearWaiters = [];
+      void this.enqueue(() => this.runClear(waiters)).catch(
+        (err) => console.error("RAG: Index clear error:", err)
+      );
+    }
+    if (manual || this.deps.getSettings().autoIndexOnStartup && hadChanged) {
+      this.passQueued = true;
+      this.enqueue(() => this.runPass(manual ? "manual" : "auto"));
+    }
+  }
+  /** True while chat is active or within the recent-chat quiet window. */
+  chatGated() {
+    return this.activeChats > 0 || Date.now() - this.lastChatEnd < this.quietMs;
+  }
+  /** Append work to the single serial DB-write queue. */
+  enqueue(work) {
+    const run = this.queue.then(work, work);
+    this.queue = run.then(
+      () => void 0,
+      () => void 0
+    );
+    return run;
+  }
+  async runPass(kind) {
+    if (this.disposed) return;
+    this.indexing = true;
+    this.passQueued = false;
+    this.runAbortedForChat = false;
+    this.runCancelled = false;
+    const controller = new AbortController();
+    this.runController = controller;
+    if (this.stopQueuedRuns && this.activeChats > 0) {
+      this.runAbortedForChat = true;
+      controller.abort();
+    }
+    const progress = this.deps.createProgressNotice();
+    try {
+      this.deps.embeddingService.beginSession();
+      const result = await this.deps.indexManager.indexAll(
+        this.deps.getSettings(),
+        (current, total, filename) => {
+          progress?.setMessage?.(`RAG: Indexing\u2026 ${current} / ${total}  \u2014  ${filename}`);
+        },
+        controller.signal
+      );
+      this.finishPass(kind, result, null);
+    } catch (err) {
+      this.finishPass(kind, null, err);
+    } finally {
+      this.afterRun();
+      progress?.hide?.();
+    }
+  }
+  async runFile(path2) {
+    if (this.disposed) return;
+    const file = this.deps.resolveFile(path2);
+    if (!file) return;
+    if (file.extension !== "md" && file.extension !== "pdf") return;
+    this.indexing = true;
+    this.runAbortedForChat = false;
+    this.runCancelled = false;
+    const controller = new AbortController();
+    this.runController = controller;
+    try {
+      if (this.stopQueuedRuns && this.activeChats > 0) {
+        this.runAbortedForChat = true;
+        this.pendingChanged.add(path2);
+        this.deps.notify("RAG: Chat in progress \u2014 the file index was deferred.", 3e3);
+        return;
+      }
+      this.deps.embeddingService.beginSession();
+      const result = await this.deps.indexManager.indexCurrentFile(
+        file,
+        this.deps.getSettings()
+      );
+      if (!this.runAbortedForChat && !this.runCancelled) {
+        this.lastRun = {
+          kind: "file",
+          indexed: result.indexed,
+          skipped: result.skipped,
+          failed: result.failed,
+          path: file.path,
+          finishedAt: Date.now()
+        };
+      }
+      if (!result.skipped && !this.runAbortedForChat && !this.runCancelled) {
+        this.deps.notify(`RAG: Indexed ${file.name}.`, 3e3);
+      }
+    } catch (err) {
+      if (this.runAbortedForChat || this.runCancelled) return;
+      if (err instanceof ProviderError && err.code === "DIMENSION_MISMATCH") {
+        this.deps.notify(
+          'RAG: Embedding model changed \u2014 run "RAG: Index all files" to re-index.',
+          1e4
+        );
+      } else if (this.isDesktopAdapterError(err)) {
+        this.deps.notify(
+          "RAG: Indexing requires a desktop vault (physical file paths). It is not supported on mobile.",
+          1e4
+        );
+      } else {
+        this.deps.notify(
+          `RAG: Index failed \u2014 ${err.message ?? "unknown error"}`,
+          8e3
+        );
+      }
+    } finally {
+      this.afterRun();
+    }
+  }
+  /** Remove queued paths, one at a time (serialized). Re-created paths are skipped. */
+  async runRemovals() {
+    if (this.disposed) return;
+    for (const path2 of [...this.pendingRemovals]) {
+      if (this.pendingChanged.has(path2)) {
+        this.pendingRemovals.delete(path2);
+        continue;
+      }
+      await this.deps.indexManager.removeFile(path2);
+      this.pendingRemovals.delete(path2);
+    }
+  }
+  async runClear(waiters) {
+    try {
+      await this.deps.vectorStore.clear(this.deps.getSettings().embeddingModel);
+    } finally {
+      waiters.forEach((w) => w());
+    }
+  }
+  finishPass(kind, result, err) {
+    if (this.wasAborted(err)) {
+      if (this.runCancelled) this.deps.notify("RAG: Indexing cancelled.", 4e3);
+      return;
+    }
+    if (err !== null) {
+      if (err instanceof ProviderError && err.code === "DIMENSION_MISMATCH") {
+        this.deps.notify(
+          'RAG: Embedding model changed \u2014 run "RAG: Index all files" to re-index.',
+          1e4
+        );
+      } else if (this.isDesktopAdapterError(err)) {
+        this.deps.notify(
+          "RAG: Indexing requires a desktop vault (physical file paths). It is not supported on mobile.",
+          1e4
+        );
+      } else {
+        this.deps.notify(
+          `RAG: Indexing failed \u2014 ${err.message ?? "unknown error"}`,
+          8e3
+        );
+      }
+      this.lastRun = {
+        kind,
+        indexed: 0,
+        skipped: 0,
+        failed: 0,
+        error: err.message ?? "unknown error",
+        finishedAt: Date.now()
+      };
+      return;
+    }
+    if (!result) return;
+    this.lastRun = {
+      kind,
+      indexed: result.indexed,
+      skipped: result.skipped,
+      failed: result.failed,
+      finishedAt: Date.now()
+    };
+    const parts = [`${result.indexed} indexed`];
+    if (result.skipped > 0) parts.push(`${result.skipped} skipped`);
+    if (result.failed > 0) parts.push(`${result.failed} failed`);
+    this.deps.notify(
+      kind === "auto" ? `RAG: Auto index done \u2014 ${parts.join(", ")}.` : `RAG: Done \u2014 ${parts.join(", ")}.`,
+      5e3
+    );
+    if (result.warnings.length > 0) {
+      this.deps.notify(`RAG warnings: ${result.warnings.join("; ")}`, 8e3);
+    }
+  }
+  wasAborted(err) {
+    if (this.runAbortedForChat || this.runCancelled) return true;
+    return err instanceof Error && err.message === "Indexing aborted";
+  }
+  /** The GCF index needs physical file paths — unavailable on non-desktop vaults. */
+  isDesktopAdapterError(err) {
+    return err instanceof Error && err.message.startsWith("GCF index requires a desktop vault adapter");
+  }
+  /** Common run teardown: DB is safe for queries again, release the model. */
+  afterRun() {
+    this.indexing = false;
+    this.runController = null;
+    this.deps.embeddingService.endSession();
+    void this.deps.embeddingService.dispose().catch((err) => console.error("RAG: Embedder dispose failed:", err));
+    this.maybeRunPass();
   }
 };
 
@@ -2016,12 +5726,13 @@ function visibleContent(accumulated) {
   return result.trim();
 }
 var ChatService = class {
-  constructor(provider, vectorStore, embeddingService, citationService, settings) {
+  constructor(provider, vectorStore, embeddingService, citationService, settings, acquireLease) {
     this.provider = provider;
     this.vectorStore = vectorStore;
     this.embeddingService = embeddingService;
     this.citationService = citationService;
     this.settings = settings;
+    this.acquireLease = acquireLease;
     /**
      * Conversation history for the LLM (user + assistant turns only).
      * The system message is regenerated on each turn with fresh RAG context.
@@ -2032,7 +5743,25 @@ var ChatService = class {
     return this.vectorStore.getStats().chunkCount > 0;
   }
   async ask(question, signal, onToken) {
-    await this.vectorStore.ensureLoaded(this.settings.embeddingModel);
+    const lease = this.acquireLease ? await this.acquireLease() : null;
+    try {
+      return await this.askInner(question, signal, onToken);
+    } finally {
+      lease?.end();
+    }
+  }
+  async askInner(question, signal, onToken) {
+    try {
+      await this.vectorStore.ensureLoaded(this.settings.embeddingModel);
+    } catch (err) {
+      if (err instanceof ProviderError && err.code === "DIMENSION_MISMATCH") {
+        throw new ProviderError(
+          'The index was built with a different embedding model. Run "RAG: Index all files" to rebuild the index, then try again.',
+          "DIMENSION_MISMATCH"
+        );
+      }
+      throw err;
+    }
     if (!this.hasIndexedContent()) {
       return {
         displayContent: 'You have no indexed information.\n\nTo get started, open the command palette and run "RAG: Index all files" to index your PDFs and notes.',
@@ -2041,6 +5770,7 @@ var ChatService = class {
     }
     const queryEmbedding = await this.embeddingService.embedQuery(question);
     const results = this.vectorStore.query(queryEmbedding, this.settings.topK);
+    await this.embeddingService.dispose();
     const sources = results.map((r) => this.citationService.buildCitationSource(r.chunk, r.score));
     const context = this.citationService.formatContext(sources);
     const systemMsg = {
@@ -2080,38 +5810,44 @@ ${context}`
 };
 
 // src/main.ts
-var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
+var RagPlugin = class extends import_obsidian6.Plugin {
   constructor() {
     super(...arguments);
     this.settings = { ...DEFAULT_SETTINGS };
-    this.indexAbortController = null;
-    this.isIndexing = false;
-    this.fileIndexDebounce = /* @__PURE__ */ new Map();
   }
-  // 5 minutes
   async onload() {
     await this.loadSettings();
-    const embedder = createEmbedder(this.settings, (0, import_path3.join)(
+    const embedder = createEmbedder(this.settings, (0, import_path4.join)(
       this.app.vault.adapter.getBasePath(),
       this.manifest.dir ?? ""
     ));
     const chatProvider = createChatProvider(this.settings);
     this.vectorStore = new VectorStore(this.manifest.dir ?? "", this.app);
     const chunkingService = new ChunkingService();
-    const embeddingService = new EmbeddingService(embedder);
+    this.embeddingService = new EmbeddingService(embedder);
     const citationService = new CitationService();
-    this.chatService = new ChatService(
-      chatProvider,
-      this.vectorStore,
-      embeddingService,
-      citationService,
-      this.settings
-    );
     this.indexManager = new IndexManager(
       this.app,
       chunkingService,
-      embeddingService,
+      this.embeddingService,
       this.vectorStore
+    );
+    this.indexScheduler = new IndexScheduler({
+      indexManager: this.indexManager,
+      embeddingService: this.embeddingService,
+      vectorStore: this.vectorStore,
+      getSettings: () => this.settings,
+      resolveFile: (path2) => this.app.vault.getAbstractFileByPath(path2) ?? null,
+      notify: (message, timeoutMs) => new import_obsidian6.Notice(message, timeoutMs),
+      createProgressNotice: () => new import_obsidian6.Notice("RAG: Indexing\u2026 0 / ?", 0)
+    });
+    this.chatService = new ChatService(
+      chatProvider,
+      this.vectorStore,
+      this.embeddingService,
+      citationService,
+      this.settings,
+      () => this.indexScheduler.acquireChatLease()
     );
     this.registerView(
       VIEW_TYPE_RAG_CHAT,
@@ -2122,27 +5858,16 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
       "RAG: Open chat",
       () => this.openChatView()
     );
-    this.vectorStore.ensureLoaded(this.settings.embeddingModel).then(() => {
-      if (this.vectorStore.schemaUpgraded) {
-        new import_obsidian6.Notice(
-          'RAG: Index format was updated \u2014 please run "RAG: Index all files" to re-index your documents.',
-          0
-          // stays until dismissed
-        );
+    this.vectorStore.exists().then(async (exists) => {
+      if (!exists) {
+        new import_obsidian6.Notice('RAG: No index found. Run "RAG: Index all files" to get started.', 8e3);
         return;
       }
-      return this.vectorStore.exists().then((exists) => {
-        if (!exists) {
-          new import_obsidian6.Notice('RAG: No index found. Run "RAG: Index all files" to get started.', 8e3);
-        }
-      });
-    }).catch((err) => {
-      if (err instanceof ProviderError && err.code === "DIMENSION_MISMATCH") {
+      const indexedModel = await this.vectorStore.peekModel();
+      if (indexedModel && indexedModel !== this.settings.embeddingModel) {
         new import_obsidian6.Notice('RAG: Embedding model changed \u2014 run "RAG: Index all files" to re-index.', 1e4);
-      } else {
-        console.error("RAG Plugin: Failed to load index:", err);
       }
-    });
+    }).catch((err) => console.error("RAG Plugin: Failed to check index:", err));
     this.addCommand({
       id: "rag-index-current-file",
       name: "Index current file",
@@ -2150,7 +5875,7 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
         const file = this.app.workspace.getActiveFile();
         if (!file) return false;
         if (file.extension !== "pdf" && file.extension !== "md") return false;
-        if (!checking) this.indexCurrentFile(file);
+        if (!checking) this.indexScheduler.indexFile(file);
         return true;
       }
     });
@@ -2163,10 +5888,7 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
       id: "rag-cancel-index",
       name: "Cancel indexing",
       callback: () => {
-        if (this.isIndexing) {
-          this.indexAbortController?.abort();
-          new import_obsidian6.Notice("RAG: Indexing cancelled.", 4e3);
-        }
+        this.indexScheduler.cancelIndex();
       }
     });
     this.addCommand({
@@ -2177,78 +5899,32 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
     this.addSettingTab(new RagSettingTab(this.app, this));
     this.registerEvent(
       this.app.vault.on("modify", (abstractFile) => {
-        const file = abstractFile;
-        if (!this.settings.autoIndexOnStartup) return;
-        if (file.extension !== "pdf" && file.extension !== "md") return;
-        const now = Date.now();
-        const last = this.fileIndexDebounce.get(file.path) ?? 0;
-        if (now - last < _RagPlugin.INDEX_DEBOUNCE_MS) return;
-        this.fileIndexDebounce.set(file.path, now);
-        this.indexCurrentFile(file);
+        this.indexScheduler.onVaultModify(abstractFile);
       })
     );
     this.registerEvent(
       this.app.vault.on("delete", (abstractFile) => {
-        this.indexManager.removeFile(abstractFile.path).catch((err) => console.error("RAG: Remove file error:", err));
+        this.indexScheduler.onVaultDelete(abstractFile);
       })
     );
     this.registerEvent(
       this.app.vault.on("rename", (abstractFile, oldPath) => {
-        this.indexManager.removeFile(oldPath).catch((err) => console.error("RAG: Rename cleanup error:", err));
+        this.indexScheduler.onVaultRename(abstractFile, oldPath);
       })
     );
     if (this.settings.autoIndexOnStartup) {
-      setTimeout(() => this.indexAll(), 5e3);
+      this.indexScheduler.markStartup();
     }
   }
   onunload() {
-    this.indexAbortController?.abort();
+    this.indexScheduler.dispose();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_RAG_CHAT);
   }
   async indexAll() {
-    if (this.isIndexing) {
-      new import_obsidian6.Notice("RAG: Indexing already in progress.", 3e3);
-      return;
-    }
-    this.isIndexing = true;
-    this.indexAbortController = new AbortController();
-    const notice = new import_obsidian6.Notice("RAG: Indexing\u2026 0 / ?", 0);
-    try {
-      const result = await this.indexManager.indexAll(
-        this.settings,
-        (current, total, filename) => {
-          notice.setMessage(`RAG: Indexing\u2026 ${current} / ${total}  \u2014  ${filename}`);
-        },
-        this.indexAbortController.signal
-      );
-      notice.hide();
-      const parts = [`${result.indexed} indexed`];
-      if (result.skipped > 0) parts.push(`${result.skipped} skipped`);
-      if (result.failed > 0) parts.push(`${result.failed} failed`);
-      new import_obsidian6.Notice(`RAG: Done \u2014 ${parts.join(", ")}.`, 5e3);
-      if (result.warnings.length > 0) {
-        new import_obsidian6.Notice(`RAG warnings: ${result.warnings.join("; ")}`, 8e3);
-      }
-    } catch (err) {
-      notice.hide();
-      const msg = err.message ?? "";
-      if (msg !== "Indexing aborted") {
-        new import_obsidian6.Notice(`RAG: Indexing failed \u2014 ${msg}`, 8e3);
-      }
-    } finally {
-      this.isIndexing = false;
-      this.indexAbortController = null;
-    }
+    this.indexScheduler.requestManualIndex();
   }
-  async indexCurrentFile(file) {
-    try {
-      const result = await this.indexManager.indexCurrentFile(file, this.settings);
-      if (!result.skipped) {
-        new import_obsidian6.Notice(`RAG: Indexed ${file.name}.`, 3e3);
-      }
-    } catch (err) {
-      console.error("RAG: Index error:", err);
-    }
+  async clearIndex() {
+    return this.indexScheduler.clearIndex();
   }
   async openChatView() {
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_RAG_CHAT);
@@ -2269,5 +5945,3 @@ var _RagPlugin = class _RagPlugin extends import_obsidian6.Plugin {
     await this.saveData(this.settings);
   }
 };
-_RagPlugin.INDEX_DEBOUNCE_MS = 5 * 60 * 1e3;
-var RagPlugin = _RagPlugin;

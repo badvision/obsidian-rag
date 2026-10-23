@@ -36,50 +36,59 @@ export class IndexManager {
     onProgress?: (current: number, total: number, filename: string) => void,
     signal?: AbortSignal
   ): Promise<IndexAllResult> {
-    await this.vectorStore.ensureLoaded(settings.embeddingModel);
+    // Disk-backed run: no query vector DB is resident while indexing. The
+    // session publishes exactly once, in the finally block, so an abort or
+    // error publishes the completed files and never loses the committed index.
+    await this.vectorStore.prepareForIndexing(settings.embeddingModel);
     const files = this.getFilesToIndex(settings.indexScope);
     const result: IndexAllResult = { indexed: 0, skipped: 0, failed: 0, warnings: [] };
-    let saveCounter = 0;
 
-    for (let i = 0; i < files.length; i++) {
-      if (signal?.aborted) break;
-      const file = files[i];
-      onProgress?.(i + 1, files.length, file.name);
-
-      try {
-        let fileResult;
-        if (file.extension === 'pdf') {
-          fileResult = await this.pdfIndexer.indexFile(file, settings, undefined, signal);
-        } else {
-          fileResult = await this.noteIndexer.indexFile(file, settings, signal);
+    try {
+      // Sweep stale entries: indexed paths whose source file is gone from the
+      // vault (regardless of scope) are removed so deleted sources don't linger.
+      const vaultPaths = new Set(this.app.vault.getFiles().map(f => f.path));
+      for (const p of this.vectorStore.getIndexedPaths()) {
+        if (!vaultPaths.has(p)) {
+          await this.vectorStore.removeFile(p);
         }
+      }
 
-        if (fileResult.skipped) {
-          result.skipped++;
-        } else {
-          result.indexed++;
-          if (fileResult.warningScannedPdf) {
-            result.warnings.push(`'${file.name}' may be scanned — no text layer found on most pages.`);
+      for (let i = 0; i < files.length; i++) {
+        if (signal?.aborted) break;
+        const file = files[i];
+        onProgress?.(i + 1, files.length, file.name);
+
+        try {
+          let fileResult;
+          if (file.extension === 'pdf') {
+            fileResult = await this.pdfIndexer.indexFile(file, settings, undefined, signal);
+          } else {
+            fileResult = await this.noteIndexer.indexFile(file, settings, signal);
           }
-        }
-      } catch (err) {
-        if ((err as Error).message === 'Indexing aborted') break;
-        console.error(`Failed to index ${file.path}:`, err);
-        result.failed++;
-      }
 
-      saveCounter++;
-      if (saveCounter % 10 === 0) {
-        await this.vectorStore.save();
+          if (fileResult.skipped) {
+            result.skipped++;
+          } else {
+            result.indexed++;
+            if (fileResult.warningScannedPdf) {
+              result.warnings.push(`'${file.name}' may be scanned — no text layer found on most pages.`);
+            }
+          }
+        } catch (err) {
+          if ((err as Error).message === 'Indexing aborted') break;
+          console.error(`Failed to index ${file.path}:`, err);
+          result.failed++;
+        }
       }
+    } finally {
+      await this.vectorStore.finishIndexing();
     }
 
-    await this.vectorStore.save();
     return result;
   }
 
   async indexCurrentFile(file: TFile, settings: RagPluginSettings): Promise<IndexAllResult> {
-    await this.vectorStore.ensureLoaded(settings.embeddingModel);
+    await this.vectorStore.prepareForIndexing(settings.embeddingModel);
     const result: IndexAllResult = { indexed: 0, skipped: 0, failed: 0, warnings: [] };
     try {
       let fileResult;
@@ -93,13 +102,13 @@ export class IndexManager {
       if (fileResult.warningScannedPdf) result.warnings.push(`'${file.name}' may be scanned.`);
     } catch (err) {
       result.failed++;
+    } finally {
+      await this.vectorStore.finishIndexing();
     }
-    await this.vectorStore.save();
     return result;
   }
 
   async removeFile(vaultPath: string): Promise<void> {
-    this.vectorStore.removeFile(vaultPath);
-    await this.vectorStore.save();
+    await this.vectorStore.removeFile(vaultPath);
   }
 }

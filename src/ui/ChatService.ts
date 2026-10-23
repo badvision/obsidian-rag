@@ -5,6 +5,7 @@ import { ChatMessage, ProviderError } from '../providers/types';
 import type { IChatProvider } from '../providers/types';
 import { RagPluginSettings } from '../settings';
 import { CitationSource } from '../rag/types';
+import type { ChatLease } from '../indexScheduler';
 
 export interface ChatResult {
   displayContent: string;
@@ -45,7 +46,9 @@ export class ChatService {
     private vectorStore: VectorStore,
     private embeddingService: EmbeddingService,
     private citationService: CitationService,
-    private settings: RagPluginSettings
+    private settings: RagPluginSettings,
+    /** Chat activity lease: held for the entire ask() flow so index work waits for query safety. */
+    private acquireLease?: () => Promise<ChatLease>
   ) {}
 
   hasIndexedContent(): boolean {
@@ -57,7 +60,31 @@ export class ChatService {
     signal: AbortSignal,
     onToken?: (visible: string, state: StreamState) => void
   ): Promise<ChatResult> {
-    await this.vectorStore.ensureLoaded(this.settings.embeddingModel);
+    const lease = this.acquireLease ? await this.acquireLease() : null;
+    try {
+      return await this.askInner(question, signal, onToken);
+    } finally {
+      lease?.end();
+    }
+  }
+
+  private async askInner(
+    question: string,
+    signal: AbortSignal,
+    onToken?: (visible: string, state: StreamState) => void
+  ): Promise<ChatResult> {
+    try {
+      await this.vectorStore.ensureLoaded(this.settings.embeddingModel);
+    } catch (err) {
+      // A stale-model index must read as an action, not a raw store error.
+      if (err instanceof ProviderError && err.code === 'DIMENSION_MISMATCH') {
+        throw new ProviderError(
+          'The index was built with a different embedding model. Run "RAG: Index all files" to rebuild the index, then try again.',
+          'DIMENSION_MISMATCH'
+        );
+      }
+      throw err;
+    }
 
     if (!this.hasIndexedContent()) {
       return {
@@ -71,6 +98,8 @@ export class ChatService {
     // RAG lookup fresh for this question
     const queryEmbedding = await this.embeddingService.embedQuery(question);
     const results = this.vectorStore.query(queryEmbedding, this.settings.topK);
+    // Release the embedding model before (potentially long) answer generation.
+    await this.embeddingService.dispose();
     const sources = results.map(r => this.citationService.buildCitationSource(r.chunk, r.score));
     const context = this.citationService.formatContext(sources);
 

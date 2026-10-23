@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - '[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and publish (e.g. 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  # One job per target platform, running ON that platform so the staged
+  # node_modules carries the correct onnxruntime-node native binding
+  # (bin/napi-v6/<platform>/<arch>/) for the zip.
+  dist:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest   # Apple Silicon arm64
+            platform: darwin-arm64
+          - os: windows-latest # x64 Intel
+            platform: win-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (installs this platform's native ONNX binding)
+        run: npm ci
+
+      - name: Smoke-test the native ONNX binding on this platform
+        run: node -e "require('onnxruntime-node'); console.log('onnxruntime-node loaded on', process.platform, process.arch)"
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      # The bundle is platform-independent; the suite runs once (macOS) to
+      # avoid duplicating it on every matrix leg.
+      - name: Run tests
+        if: runner.os == 'macOS'
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Stage plugin folder and zip
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          V="${TAG#v}"
+          # Dev dependencies (jest, typescript, ...) are not needed at runtime.
+          npm prune --omit=dev
+          mkdir -p dist/obsidian-rag
+          cp main.js manifest.json styles.css package.json package-lock.json dist/obsidian-rag/
+          cp -R node_modules dist/obsidian-rag/
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "../obsidian-rag-v${V}-${{ matrix.platform }}.zip" obsidian-rag > /dev/null
+          else
+            zip -rq "../obsidian-rag-v${V}-${{ matrix.platform }}.zip" obsidian-rag
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.platform }}
+          path: obsidian-rag-v*-${{ matrix.platform }}.zip
+          retention-days: 1
+
+  release:
+    needs: dist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: plugin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          body: |
+            Major release. The on-disk index format changed (the old format is
+            not read by this version): run **RAG: Index all files** once after
+            upgrading to rebuild the index.
+
+            - New disk-backed GCF index: crash-safe atomic publication, bounded
+              memory for large vaults, unchanged-file skipping by mtime.
+            - Quiet-window index scheduler: background re-indexing waits for
+              vault and chat activity to settle; active chat preempts indexing.
+            - Managed local ONNX embedding worker: runs in a separate utility
+              process; model downloads once, then fully offline.
+            - Live index status in settings: up-to-date / queued / in-progress
+              summary with last-run counts, beside the Clear and Re-index
+              buttons.
+            - Per-platform pre-packaged zips (built in CI on the target OS).
+          files: |
+            dist/obsidian-rag-v*.zip
+            main.js
+            manifest.json
+            styles.css

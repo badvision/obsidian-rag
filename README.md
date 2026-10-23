@@ -2,7 +2,7 @@
 
 Local retrieval-augmented generation (RAG) for [Obsidian](https://obsidian.md). Ask questions about your vault — PDFs and Markdown notes — with a local or CLI LLM and a local embedding model. Embeddings stay on your machine; no data leaves it.
 
-Supports [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), or **self-hosted in-process ONNX models** for embeddings, and Ollama, LM Studio, or **any one-shot LLM CLI** (OpenCode, OMP, or your own command) for chat.
+Supports [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), or **self-hosted local ONNX models** for embeddings, and Ollama, LM Studio, or **any one-shot LLM CLI** (OpenCode, OMP, or your own command) for chat.
 
 ---
 
@@ -21,11 +21,11 @@ This plugin is not yet in the Obsidian community plugin directory. Install it ma
 
 ### Option A — Pre-packaged zip (includes self-hosted ONNX support; recommended)
 
-1. Download `obsidian-rag-v0.3.2.zip` from the [latest release](../../releases/latest).
+1. Download the zip for your platform from the [latest release](../../releases/latest): `obsidian-rag-v1.0.0-darwin-arm64.zip` (macOS, Apple Silicon) or `obsidian-rag-v1.0.0-win-x64.zip` (Windows, 64-bit).
 2. Unzip it directly into your vault's `.obsidian/plugins/` folder — the archive already contains the `obsidian-rag/` plugin folder, including the `node_modules` the self-hosted ONNX provider needs.
 3. Open Obsidian → **Settings → Community plugins** → turn off Safe Mode if prompted → enable **Obsidian RAG**.
 
-This package ships the ONNX runtime native binding for **macOS on Apple Silicon** only. If you only use Ollama or LM Studio (no ONNX), the three-file Option B works on any platform. On other OS/architectures with ONNX, use Option C and run `npm install` in the plugin folder.
+Each package ships the ONNX runtime native binding for its own platform (built in CI on that OS/architecture). If you only use Ollama or LM Studio (no ONNX), the three-file Option B works on any platform. On other OS/architectures with ONNX (e.g. Linux), use Option C and run `npm install` in the plugin folder.
 
 ### Option B — Three files (Ollama / LM Studio providers only)
 
@@ -51,9 +51,9 @@ Then copy `main.js`, `manifest.json`, and `styles.css` into your vault's `.obsid
 
 ## Prerequisites
 
-You need an **embedding provider** with an embedding model — a running local server (Ollama or LM Studio), or **none at all**: the self-hosted ONNX option runs a small embedding model directly inside Obsidian (downloaded once, ~20-130 MB, then fully offline). The **chat** model can come from the same local server *or* from a one-shot LLM CLI you already use (OpenCode, OMP, …), so you can chat through a cloud model your CLI is configured with while embeddings stay local.
+You need an **embedding provider** with an embedding model — a running local server (Ollama or LM Studio), or **none at all**: the self-hosted ONNX option runs a small embedding model in a managed local worker (downloaded once, then fully offline). The **chat** model can come from the same local server *or* from a one-shot LLM CLI you already use (OpenCode, OMP, …), so you can chat through a cloud model your CLI is configured with while embeddings stay local.
 
-Before configuring Obsidian RAG, start your embedding provider and download an embedding model into it. The plugin cannot download models itself — it connects to whatever is already running or installed on your machine.
+For Ollama or LM Studio, start the server and install an embedding model before configuring Obsidian RAG. The ONNX provider instead downloads its selected model on first use.
 
 ### Ollama (recommended)
 
@@ -80,15 +80,15 @@ The server must be running with both models loaded before you index your vault o
 
 ### Self-hosted ONNX (no server)
 
-No Ollama, no LM Studio — the plugin runs a small embedding model **inside Obsidian's own process** using [transformers.js](https://huggingface.co/docs/transformers.js) and the ONNX Runtime native bindings.
+No Ollama, no LM Studio — the plugin manages a local embedding worker using [transformers.js](https://huggingface.co/docs/transformers.js) and ONNX Runtime. Native inference runs in a separate Electron utility process, not Obsidian's renderer. No external server or Node installation is required.
 
-1. In Settings → Obsidian RAG, choose **Self-hosted ONNX (in-process, no server)** for the Embedding Provider.
+1. In Settings → Obsidian RAG, choose **Managed local ONNX worker (no server)** for the Embedding Provider.
 2. Pick a model — curated picks include `all-MiniLM-L6-v2` (384d, fastest), `all-mpnet-base-v2` (768d, strong), `bge-small-en-v1.5` (384d), `paraphrase-multilingual-MiniLM-L12-v2` (384d, multilingual), and `nomic-embed-text-v1.5` int8 (768d — same model family as LM Studio/Ollama nomic). Any Hugging Face repo with an ONNX export works too.
-3. Click **Test Connection**. The model downloads on first use and is cached in the plugin folder (`models/`) — afterwards it works with zero network and zero external processes.
+3. Click **Test Connection**. The model downloads on first use and is cached in the plugin folder (`models/`) — afterwards it needs no network or separately managed server.
 
-Desktop only: the plugin directory must contain `node_modules` with `@huggingface/transformers` and `onnxruntime-node` — the pre-packaged release zip already includes them (macOS Apple Silicon). Dependencies are loaded lazily via `createRequire` rooted at the absolute installed plugin path, since Obsidian's renderer-level `require` cannot resolve plugin-local packages; load failures retain the original dependency error.
+Desktop only: the plugin directory must contain `node_modules` with `@huggingface/transformers` and `onnxruntime-node` — the pre-packaged release zips already include them (macOS Apple Silicon and Windows x64). The worker resolves dependencies from the installed plugin path; load failures retain the original dependency error. Existing models in Obsidian's browser cache are copied to the filesystem cache without downloading them again.
 
-Inference runs on CPU: on Apple Silicon, roughly 4 ms per 300-400-token chunk for the 384d models and 16-21 ms for the 768d models — a 1,000-chunk vault embeds in about 5-20 s. An optional **CoreML** device routes inference through Apple's GPU/ANE and auto-falls back to CPU if a model is unsupported there; on Apple Silicon it measured ~4× slower than CPU for these model sizes (~18-74 ms/chunk), since the EP's per-call overhead dominates at this scale — keep it as headroom for much larger embedding models.
+CPU is the default. The CPU memory arena is disabled to avoid its large retained allocations. Optional **CoreML** uses Apple's GPU/ANE and falls back to CPU if unsupported. An indexing run reuses one model worker; the worker is disposed after the run. Query embedding also releases its worker before answer generation.
 
 ---
 
@@ -100,7 +100,7 @@ Open **Settings → Obsidian RAG** after enabling the plugin.
 
 The embedding and chat roles are configured **independently** — you can embed locally and chat through a CLI (or vice versa).
 
-**Embeddings** — *Ollama*, *LM Studio / MLX*, or *Self-hosted ONNX* (no server; model runs in-process, downloaded once and cached in the plugin folder). Server providers each have their own Base URL (default `http://localhost:11434` / `http://localhost:1234`).
+**Embeddings** — *Ollama*, *LM Studio / MLX*, or *Self-hosted ONNX* (no server; model runs in a managed worker, downloaded once and cached in the plugin folder). Server providers each have their own Base URL (default `http://localhost:11434` / `http://localhost:1234`).
 
 **Chat** — *Ollama*, *LM Studio / MLX*, or *CLI*.
 
@@ -171,7 +171,13 @@ Chunk size also matters: if you raise `Chunk Size` significantly (e.g. to 1000+ 
 |---|---|
 | **Index Scope** | *PDFs and Markdown notes* (default) or *PDFs only*. |
 | **Chunk Size** | Approximate token count per chunk (default 500). Larger chunks preserve more context per piece; smaller chunks improve retrieval precision. |
-| **Auto-index on Startup** | Re-index any changed files when Obsidian loads. Keeps the index fresh automatically at the cost of a short startup delay. |
+| **Auto-index on Startup** | Queue a startup refresh and track changed files. Automatic indexing waits for three minutes without relevant vault or chat activity. |
+
+The index is stored at `.obsidian/plugins/obsidian-rag/index/index.gcf` using [GCF](https://www.gcformat.com/). Table fields are declared once rather than repeated for every chunk. Each chunk retains its source, text and citation metadata; its vector is encoded as little-endian IEEE-754 **Float64**, losslessly DEFLATE-compressed and base64-encoded. No dimensions or numeric precision are removed.
+
+Indexing uses disk-backed staging instead of loading the existing query vectors into memory. Updates are published atomically, so an interrupted write does not replace the last committed index with a partial file. If Obsidian is force-quit mid-run, the committed index stays intact and the next indexing run discards the interrupted run's staging, re-embedding only new or changed files. Query vectors are loaded on demand after indexing, rather than eagerly at startup.
+
+File changes use a trailing-edge debounce: each change resets the quiet window, and changed paths are coalesced. Active chat and the three-minute window after chat activity prevent reindexing from taking the database offline. Manual indexing requests wait when chat has priority. Changes arriving during indexing are queued for a subsequent refresh.
 
 ---
 

@@ -180,7 +180,7 @@ export class NoteIndexer {
     const withoutFrontmatter = raw.replace(/^---[\s\S]*?---\n?/, '').trim();
 
     if (!withoutFrontmatter) {
-      this.vectorStore.upsertFile(file.path, file.stat.mtime, []);
+      await this.vectorStore.upsertFile(file.path, file.stat.mtime, []);
       return { vaultPath: file.path, skipped: false, chunkCount: 0, pageCount: 0 };
     }
 
@@ -208,7 +208,7 @@ export class NoteIndexer {
       chunks.forEach((c, i) => { c.embedding = embeddings[i]; });
     }
 
-    this.vectorStore.upsertFile(file.path, file.stat.mtime, chunks);
+    await this.vectorStore.upsertFile(file.path, file.stat.mtime, chunks);
     return { vaultPath: file.path, skipped: false, chunkCount: chunks.length, pageCount: 0 };
   }
 }

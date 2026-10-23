@@ -5,7 +5,7 @@ import {
   DEFAULT_ONNX_MODEL,
   TransformersModule,
 } from './onnx';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, readdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -275,22 +275,79 @@ describe('ONNX_MODELS', () => {
   });
 });
 
-describe('installed plugin module resolution', () => {
-  test('default loader resolves dependencies from the installed plugin, not the renderer or project', async () => {
-    const pluginDir = mkdtempSync(join(tmpdir(), 'rag-loader-'));
+describe('installed plugin process isolation (default path)', () => {
+  // A fake '@huggingface/transformers' resolvable only from the installed
+  // plugin's node_modules. The production (no-loader) path must load it in a
+  // real child process via the actual worker bootstrap. Vector values are
+  // exactly representable in float32, since results round-trip through a
+  // Float32Array over IPC.
+  const VECTOR_BODY = `
+      const data = new Float32Array(2);
+      data[0] = 0.5; data[1] = 1.25;
+      return { data };
+    `;
+
+  function writeFakePluginPackage(pluginDir: string, pipeBody: string): void {
     const packageDir = join(pluginDir, 'node_modules', '@huggingface', 'transformers');
     mkdirSync(packageDir, { recursive: true });
-    // A package available only inside the installed plugin. A renderer-rooted
-    // require would instead fail or load the project's real transformers.js.
-    writeFileSync(join(packageDir, 'index.js'), `
-      exports.env = {};
-      exports.pipeline = async () => async () => ({ data: [0.6, 0.8] });
-    `);
+    writeFileSync(
+      join(packageDir, 'index.js'),
+      `exports.env = {};\nexports.pipeline = async () => async (text) => { ${pipeBody} };\n`
+    );
+  }
+
+  test('default path embeds through an isolated child using the plugin-local transformers.js', async () => {
+    const pluginDir = mkdtempSync(join(tmpdir(), 'rag-proc-'));
+    writeFakePluginPackage(pluginDir, VECTOR_BODY);
     try {
-      const result = await makeEmbedder({ pluginDir }).embed(['probe']);
-      expect(result).toEqual({ embeddings: [[0.6, 0.8]], dimension: 2 });
+      const embedder = makeEmbedder({ pluginDir });
+      const result = await embedder.embed(['probe']);
+      // Resolution happens in the child from the installed plugin, not from
+      // the renderer or the project's real transformers.js.
+      expect(result).toEqual({ embeddings: [[0.5, 1.25]], dimension: 2 });
+      await embedder.dispose();
+      // The worker file is cleaned up on dispose.
+      const models = join(pluginDir, 'models');
+      expect(readdirSync(models).filter(f => f.startsWith('.onnx-worker'))).toEqual([]);
     } finally {
       rmSync(pluginDir, { recursive: true, force: true });
     }
-  });
+  }, 20000);
+
+  test('a per-inference child error fails that batch; the child stays alive and recovers', async () => {
+    const pluginDir = mkdtempSync(join(tmpdir(), 'rag-proc-'));
+    writeFakePluginPackage(
+      pluginDir,
+      `if (text === 'crash') throw new Error('simulated session crash');${VECTOR_BODY}`
+    );
+    try {
+      const embedder = makeEmbedder({ pluginDir });
+      await expect(embedder.embed(['crash'])).rejects.toMatchObject({
+        code: 'UNEXPECTED_RESPONSE',
+        message: expect.stringContaining('simulated session crash'),
+      });
+      // Same child process: the well-formed error did not kill it.
+      const result = await embedder.embed(['ok']);
+      expect(result.embeddings).toEqual([[0.5, 1.25]]);
+      await embedder.dispose();
+    } finally {
+      rmSync(pluginDir, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test('dispose releases the child process; the next embed starts a fresh one', async () => {
+    const pluginDir = mkdtempSync(join(tmpdir(), 'rag-proc-'));
+    writeFakePluginPackage(pluginDir, VECTOR_BODY);
+    try {
+      const embedder = makeEmbedder({ pluginDir });
+      await embedder.embed(['a']);
+      await embedder.dispose();
+      await embedder.dispose(); // idempotent
+      const result = await embedder.embed(['b']);
+      expect(result.embeddings).toEqual([[0.5, 1.25]]);
+      await embedder.dispose();
+    } finally {
+      rmSync(pluginDir, { recursive: true, force: true });
+    }
+  }, 20000);
 });

@@ -8,21 +8,18 @@ import { ChunkingService } from './indexer/ChunkingService';
 import { EmbeddingService } from './rag/EmbeddingService';
 import { CitationService } from './rag/CitationService';
 import { IndexManager } from './indexer/IndexManager';
+import { IndexScheduler } from './indexScheduler';
 import { RagView, VIEW_TYPE_RAG_CHAT } from './ui/RagView';
 import { ChatService } from './ui/ChatService';
-import { ProviderError } from './providers/types';
 
 export default class RagPlugin extends Plugin {
   settings: RagPluginSettings = { ...DEFAULT_SETTINGS };
 
   vectorStore!: VectorStore;
+  indexScheduler!: IndexScheduler;
   private indexManager!: IndexManager;
+  private embeddingService!: EmbeddingService;
   private chatService!: ChatService;
-
-  private indexAbortController: AbortController | null = null;
-  private isIndexing = false;
-  private fileIndexDebounce = new Map<string, number>();
-  private static readonly INDEX_DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -33,22 +30,33 @@ export default class RagPlugin extends Plugin {
     const chatProvider = createChatProvider(this.settings);
     this.vectorStore = new VectorStore(this.manifest.dir ?? '', this.app);
     const chunkingService = new ChunkingService();
-    const embeddingService = new EmbeddingService(embedder);
+    this.embeddingService = new EmbeddingService(embedder);
     const citationService = new CitationService();
+    this.indexManager = new IndexManager(
+      this.app,
+      chunkingService,
+      this.embeddingService,
+      this.vectorStore
+    );
+
+    this.indexScheduler = new IndexScheduler({
+      indexManager: this.indexManager,
+      embeddingService: this.embeddingService,
+      vectorStore: this.vectorStore,
+      getSettings: () => this.settings,
+      resolveFile: (path: string) =>
+        (this.app.vault.getAbstractFileByPath(path) as TFile | null) ?? null,
+      notify: (message, timeoutMs) => new Notice(message, timeoutMs),
+      createProgressNotice: () => new Notice('RAG: Indexing… 0 / ?', 0),
+    });
 
     this.chatService = new ChatService(
       chatProvider,
       this.vectorStore,
-      embeddingService,
+      this.embeddingService,
       citationService,
-      this.settings
-    );
-
-    this.indexManager = new IndexManager(
-      this.app,
-      chunkingService,
-      embeddingService,
-      this.vectorStore
+      this.settings,
+      () => this.indexScheduler.acquireChatLease()
     );
 
     this.registerView(
@@ -62,28 +70,20 @@ export default class RagPlugin extends Plugin {
       () => this.openChatView()
     );
 
-    this.vectorStore.ensureLoaded(this.settings.embeddingModel)
-      .then(() => {
-        if (this.vectorStore.schemaUpgraded) {
-          new Notice(
-            'RAG: Index format was updated — please run "RAG: Index all files" to re-index your documents.',
-            0  // stays until dismissed
-          );
+    // No eager index load: the index is loaded on demand for chat and stays
+    // disk-backed during index runs. These are cheap metadata checks only.
+    this.vectorStore.exists()
+      .then(async exists => {
+        if (!exists) {
+          new Notice('RAG: No index found. Run "RAG: Index all files" to get started.', 8000);
           return;
         }
-        return this.vectorStore.exists().then(exists => {
-          if (!exists) {
-            new Notice('RAG: No index found. Run "RAG: Index all files" to get started.', 8000);
-          }
-        });
-      })
-      .catch((err: unknown) => {
-        if (err instanceof ProviderError && err.code === 'DIMENSION_MISMATCH') {
+        const indexedModel = await this.vectorStore.peekModel();
+        if (indexedModel && indexedModel !== this.settings.embeddingModel) {
           new Notice('RAG: Embedding model changed — run "RAG: Index all files" to re-index.', 10000);
-        } else {
-          console.error('RAG Plugin: Failed to load index:', err);
         }
-      });
+      })
+      .catch(err => console.error('RAG Plugin: Failed to check index:', err));
 
     this.addCommand({
       id: 'rag-index-current-file',
@@ -92,7 +92,7 @@ export default class RagPlugin extends Plugin {
         const file = this.app.workspace.getActiveFile();
         if (!file) return false;
         if (file.extension !== 'pdf' && file.extension !== 'md') return false;
-        if (!checking) this.indexCurrentFile(file);
+        if (!checking) this.indexScheduler.indexFile(file);
         return true;
       },
     });
@@ -107,10 +107,7 @@ export default class RagPlugin extends Plugin {
       id: 'rag-cancel-index',
       name: 'Cancel indexing',
       callback: () => {
-        if (this.isIndexing) {
-          this.indexAbortController?.abort();
-          new Notice('RAG: Indexing cancelled.', 4000);
-        }
+        this.indexScheduler.cancelIndex();
       },
     });
 
@@ -124,92 +121,40 @@ export default class RagPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on('modify', (abstractFile: TAbstractFile) => {
-        const file = abstractFile as TFile;
-        if (!this.settings.autoIndexOnStartup) return;
-        if (file.extension !== 'pdf' && file.extension !== 'md') return;
-        const now = Date.now();
-        const last = this.fileIndexDebounce.get(file.path) ?? 0;
-        if (now - last < RagPlugin.INDEX_DEBOUNCE_MS) return;
-        this.fileIndexDebounce.set(file.path, now);
-        this.indexCurrentFile(file);
+        this.indexScheduler.onVaultModify(abstractFile as TFile);
       })
     );
 
     this.registerEvent(
       this.app.vault.on('delete', (abstractFile: TAbstractFile) => {
-        this.indexManager.removeFile(abstractFile.path)
-          .catch(err => console.error('RAG: Remove file error:', err));
+        this.indexScheduler.onVaultDelete(abstractFile);
       })
     );
 
     this.registerEvent(
       this.app.vault.on('rename', (abstractFile: TAbstractFile, oldPath: string) => {
-        this.indexManager.removeFile(oldPath)
-          .catch(err => console.error('RAG: Rename cleanup error:', err));
+        this.indexScheduler.onVaultRename(abstractFile, oldPath);
       })
     );
 
     if (this.settings.autoIndexOnStartup) {
-      setTimeout(() => this.indexAll(), 5000);
+      // Runs after the quiet window elapses — never eagerly on startup.
+      this.indexScheduler.markStartup();
     }
   }
 
   onunload(): void {
-    this.indexAbortController?.abort();
+    // Aborts any in-flight run, stops pending quiet work, releases the embedder.
+    this.indexScheduler.dispose();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_RAG_CHAT);
   }
 
   async indexAll(): Promise<void> {
-    if (this.isIndexing) {
-      new Notice('RAG: Indexing already in progress.', 3000);
-      return;
-    }
-
-    this.isIndexing = true;
-    this.indexAbortController = new AbortController();
-
-    const notice = new Notice('RAG: Indexing… 0 / ?', 0);
-
-    try {
-      const result = await this.indexManager.indexAll(
-        this.settings,
-        (current, total, filename) => {
-          notice.setMessage(`RAG: Indexing… ${current} / ${total}  —  ${filename}`);
-        },
-        this.indexAbortController.signal
-      );
-
-      notice.hide();
-
-      const parts: string[] = [`${result.indexed} indexed`];
-      if (result.skipped > 0) parts.push(`${result.skipped} skipped`);
-      if (result.failed > 0) parts.push(`${result.failed} failed`);
-      new Notice(`RAG: Done — ${parts.join(', ')}.`, 5000);
-
-      if (result.warnings.length > 0) {
-        new Notice(`RAG warnings: ${result.warnings.join('; ')}`, 8000);
-      }
-    } catch (err) {
-      notice.hide();
-      const msg = (err as Error).message ?? '';
-      if (msg !== 'Indexing aborted') {
-        new Notice(`RAG: Indexing failed — ${msg}`, 8000);
-      }
-    } finally {
-      this.isIndexing = false;
-      this.indexAbortController = null;
-    }
+    this.indexScheduler.requestManualIndex();
   }
 
-  private async indexCurrentFile(file: TFile): Promise<void> {
-    try {
-      const result = await this.indexManager.indexCurrentFile(file, this.settings);
-      if (!result.skipped) {
-        new Notice(`RAG: Indexed ${file.name}.`, 3000);
-      }
-    } catch (err) {
-      console.error('RAG: Index error:', err);
-    }
+  async clearIndex(): Promise<void> {
+    return this.indexScheduler.clearIndex();
   }
 
   private async openChatView(): Promise<void> {

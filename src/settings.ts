@@ -1,7 +1,9 @@
-import { App, Plugin, PluginSettingTab, Setting, Notice } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Notice, moment } from 'obsidian';
 import { join } from 'path';
 import type { FileSystemAdapter } from 'obsidian';
+import type { IndexSchedulerStatus } from './indexScheduler';
 import { createEmbedder, createChatProvider } from './providers/factory';
+import type { IEmbedder } from './providers/types';
 import {
   CliPreset,
   CLI_PRESETS,
@@ -92,8 +94,17 @@ export interface SettingTabPlugin {
   settings: RagPluginSettings;
   saveSettings: () => Promise<void>;
   indexAll: () => Promise<void>;
+  clearIndex: () => Promise<void>;
   manifest: { dir?: string };
-  vectorStore?: { clear: (embeddingModel: string) => Promise<void> };
+  indexScheduler: { getStatus(): IndexSchedulerStatus };
+  vectorStore: {
+    peekStats(): Promise<{
+      fileCount: number;
+      chunkCount: number;
+      embeddingModel: string;
+      updatedAt: string;
+    } | null>;
+  };
 }
 
 export class RagSettingTab extends PluginSettingTab {
@@ -101,11 +112,13 @@ export class RagSettingTab extends PluginSettingTab {
     super(app, plugin as unknown as Plugin); // base class requires Plugin; tab only uses the SettingTabPlugin surface
   }
 
+  private statusTimer: number | null = null;
+
   private addModelDropdown(
     containerEl: HTMLElement,
     name: string,
     desc: string,
-    provider: { listModels(): Promise<string[]> },
+    provider: { listModels(): Promise<string[]>; dispose?(): Promise<void> },
     getValue: () => string,
     setValue: (v: string) => Promise<void>
   ): void {
@@ -143,12 +156,19 @@ export class RagSettingTab extends PluginSettingTab {
     }).catch(() => {
       select.empty();
       select.createEl('option', { text: getValue(), value: getValue() }).selected = true;
+    }).finally(() => {
+      // Release any inference worker spawned to list models.
+      void provider.dispose?.().catch(() => {});
     });
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    if (this.statusTimer !== null) {
+      window.clearInterval(this.statusTimer);
+      this.statusTimer = null;
+    }
 
     containerEl.createEl('h2', { text: 'RAG Plugin Settings' });
 
@@ -161,7 +181,7 @@ export class RagSettingTab extends PluginSettingTab {
       .addDropdown(dd => dd
         .addOption('ollama', 'Ollama')
         .addOption('lmstudio', 'LM Studio / MLX')
-        .addOption('onnx', 'Self-hosted ONNX (in-process, no server)')
+        .addOption('onnx', 'Managed local ONNX worker (no server)')
         .setValue(this.plugin.settings.embeddingProvider)
         .onChange(async (value: string) => {
           this.plugin.settings.embeddingProvider = value as EmbeddingProviderName;
@@ -202,19 +222,19 @@ export class RagSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName('ONNX Model Info')
         .setDesc(
-          `Model downloads on first use (~20-130 MB) and is cached at ` +
+          `Model downloads on first use (~20-150 MB) and is cached at ` +
           `${this.plugin.manifest?.dir ?? '.obsidian/plugins/obsidian-rag'}/models/. ` +
-          'No server or network needed afterwards. Runs inside Obsidian — first use of a model takes a few seconds.'
+          'No server or network needed afterwards. Inference runs in a managed local worker — first use of a model takes a few seconds.'
         );
       new Setting(containerEl)
         .setName('ONNX Device')
         .setDesc(
-          'Where inference runs. CoreML uses Apple Silicon (GPU/ANE) and is much faster; ' +
+          'Where inference runs. CoreML uses Apple Silicon (GPU/ANE) where available; ' +
           'if a model is unsupported there it automatically falls back to CPU.'
         )
         .addDropdown(dd => dd
           .addOption('cpu', 'CPU (safe, portable)')
-          .addOption('coreml', 'CoreML — Apple GPU/ANE (faster)')
+          .addOption('coreml', 'CoreML — Apple GPU/ANE')
           .setValue(this.plugin.settings.onnxDevice)
           .onChange(async (value: string) => {
             this.plugin.settings.onnxDevice = value as 'cpu' | 'coreml';
@@ -331,8 +351,9 @@ export class RagSettingTab extends PluginSettingTab {
         .onClick(async () => {
           btn.setButtonText('Testing...');
           btn.disabled = true;
+          let embedder: IEmbedder | null = null;
           try {
-            const embedder = createEmbedder(
+            embedder = createEmbedder(
               this.plugin.settings,
               join((this.app.vault.adapter as FileSystemAdapter).getBasePath(), this.plugin.manifest?.dir ?? ''),
               message => new Notice(message, 3000)
@@ -372,6 +393,9 @@ export class RagSettingTab extends PluginSettingTab {
           } catch (err) {
             new Notice(`❌ ${(err as Error).message}`, 10000);
           } finally {
+            // Release the (possibly just-spawned) inference worker — this
+            // embedder is owned by the test, not the shared EmbeddingService.
+            void embedder?.dispose?.().catch(() => {});
             btn.setButtonText('Test');
             btn.disabled = false;
           }
@@ -440,30 +464,97 @@ export class RagSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Index Location')
-      .setDesc(`Stored at: ${this.plugin.manifest?.dir ?? '.obsidian/plugins/obsidian-rag'}/index/index.json`);
+      .setDesc(`Stored at: ${this.plugin.manifest?.dir ?? '.obsidian/plugins/obsidian-rag'}/index/index.gcf`);
 
-    new Setting(containerEl)
-      .setName('Clear Index')
-      .setDesc('Clear indexed data, or re-index files using the current embedding settings. Unchanged files are skipped.')
-      .addButton(btn => btn
-        .setButtonText('Clear')
-        .onClick(async () => {
-          if (confirm('Clear the entire document index? This cannot be undone.')) {
-            await this.plugin.vectorStore?.clear(this.plugin.settings.embeddingModel);
-            new Notice('Index cleared. Run "RAG: Index all files" to re-index.');
-          }
-        })
-      )
-      .addButton(btn => btn
-        .setButtonText('Re-index')
-        .onClick(async () => {
-          btn.disabled = true;
-          try {
-            await this.plugin.indexAll();
-          } finally {
-            btn.disabled = false;
-          }
-        })
-      );
+    const statusSetting = new Setting(containerEl)
+      .setName('Index Status')
+      .setDesc('');
+    statusSetting.addButton(btn => btn
+      .setButtonText('Clear')
+      .onClick(async () => {
+        if (confirm('Clear the entire document index? This cannot be undone.')) {
+          await this.plugin.clearIndex();
+          new Notice('Index cleared. Run "RAG: Index all files" to re-index.');
+          void this.refreshIndexStatus(statusSetting);
+        }
+      })
+    )
+    .addButton(btn => btn
+      .setButtonText('Re-index')
+      .onClick(async () => {
+        btn.disabled = true;
+        try {
+          await this.plugin.indexAll();
+        } finally {
+          btn.disabled = false;
+        }
+        void this.refreshIndexStatus(statusSetting);
+      })
+    );
+    this.refreshIndexStatus(statusSetting);
+  }
+
+  /**
+   * Render the live index status into the "Index Status" row: in-flight run,
+   * then queued work, then the last published index (counts + when). The
+   * counts come from a bounded disk peek (header scalars + summary trailer)
+   * — the query DB is never loaded for this. Refreshes on an interval while
+   * the tab is open because an index pass can take minutes.
+   */
+  private async refreshIndexStatus(statusSetting: Setting): Promise<void> {
+    let summary: string;
+    try {
+      summary = await this.indexStatusSummary();
+    } catch (err) {
+      summary = `Index status unavailable — ${(err as Error).message ?? 'unknown error'}`;
+    }
+    statusSetting.descEl?.setText(summary);
+    if (typeof window === 'undefined') return; // non-renderer context (tests)
+    if (this.statusTimer) window.clearInterval(this.statusTimer);
+    this.statusTimer = window.setInterval(
+      () => { void this.refreshIndexStatus(statusSetting); },
+      5000
+    );
+  }
+
+  /** Current status text for the "Index Status" row (see refreshIndexStatus). */
+  private async indexStatusSummary(): Promise<string> {
+    const status = this.plugin.indexScheduler.getStatus();
+    if (status.indexing) return 'Indexing in progress…';
+
+    const queued: string[] = [];
+    if (status.queued.clear) queued.push('clear');
+    if (status.queued.fullPass) queued.push('full re-index');
+    if (status.queued.changes > 0) queued.push(`${status.queued.changes} changed file${status.queued.changes === 1 ? '' : 's'}`);
+    if (status.queued.removals > 0) queued.push(`${status.queued.removals} removal${status.queued.removals === 1 ? '' : 's'}`);
+    if (queued.length > 0) {
+      return `Queued (runs after the quiet window): ${queued.join(', ')}.`;
+    }
+
+    const stats = await this.plugin.vectorStore.peekStats();
+    // An empty committed index is indistinguishable from no index for the
+    // user: offer the same rebuild prompt.
+    if (stats === null || (stats.fileCount === 0 && stats.chunkCount === 0)) {
+      return 'No index yet — run Re-index to build one.';
+    }
+
+    const parts = [
+      `${stats.fileCount} file${stats.fileCount === 1 ? '' : 's'}`,
+      `${stats.chunkCount} chunk${stats.chunkCount === 1 ? '' : 's'}`,
+    ];
+    const last = status.lastRun;
+    if (last && last.error) {
+      return `Index is up to date — ${parts.join(', ')}. Last run ${moment(last.finishedAt).fromNow()} failed: ${last.error}`;
+    }
+    if (last && last.kind === 'file') {
+      return `Index is up to date — ${parts.join(', ')} (last: ${last.path ?? 'one file'}, ${moment(last.finishedAt).fromNow()}).`;
+    }
+    if (last) {
+      const run = [`${last.indexed} indexed`];
+      if (last.skipped > 0) run.push(`${last.skipped} skipped`);
+      if (last.failed > 0) run.push(`${last.failed} failed`);
+      return `Index is up to date — ${parts.join(', ')} (last run ${moment(last.finishedAt).fromNow()}: ${run.join(', ')}).`;
+    }
+    return `Index is up to date — ${parts.join(', ')}, last indexed ${moment(stats.updatedAt).fromNow()}.`;
   }
 }

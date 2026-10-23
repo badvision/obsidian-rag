@@ -90,6 +90,17 @@ export class Setting {
 
 export const Notice = jest.fn().mockImplementation((_message: string, _duration?: number) => {});
 
+/** Minimal moment stand-in: only fromNow() is used, with coarse buckets. */
+export function moment(input?: string | number): { fromNow(): string } {
+  const then = input === undefined ? Date.now() : new Date(input).getTime();
+  const mins = Math.floor((Date.now() - then) / 60000);
+  if (mins < 1) return { fromNow: () => 'a few seconds ago' };
+  if (mins < 60) return { fromNow: () => `${mins} minute${mins === 1 ? '' : 's'} ago` };
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return { fromNow: () => `${hours} hour${hours === 1 ? '' : 's'} ago` };
+  return { fromNow: () => new Date(then).toLocaleDateString() };
+}
+
 export interface App {
   vault: Vault;
   workspace: Workspace;

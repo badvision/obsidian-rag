@@ -1,6 +1,5 @@
 import RagPlugin from './main';
 import { DEFAULT_SETTINGS } from './settings';
-import { ProviderError } from './providers/types';
 
 // Mock all service modules to avoid actual I/O
 jest.mock('./providers/factory');
@@ -8,22 +7,15 @@ jest.mock('./store/VectorStore');
 jest.mock('./indexer/ChunkingService');
 jest.mock('./rag/EmbeddingService');
 jest.mock('./rag/CitationService');
-jest.mock('./rag/QueryService');
 jest.mock('./indexer/IndexManager');
-jest.mock('./ui/RagModal');
-jest.mock('./ui/IndexProgressModal');
 
 // Pull in mocked constructors for assertion
 import { VectorStore } from './store/VectorStore';
 import { IndexManager } from './indexer/IndexManager';
-import { IndexProgressModal } from './ui/IndexProgressModal';
-import { RagModal } from './ui/RagModal';
 import { Notice } from 'obsidian';
 
 const MockVectorStore = VectorStore as jest.MockedClass<typeof VectorStore>;
 const MockIndexManager = IndexManager as jest.MockedClass<typeof IndexManager>;
-const MockIndexProgressModal = IndexProgressModal as jest.MockedClass<typeof IndexProgressModal>;
-const MockRagModal = RagModal as jest.MockedClass<typeof RagModal>;
 const MockNotice = Notice as jest.MockedClass<typeof Notice>;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +43,7 @@ function makeApp(vaultEventMap: VaultEventMap = {}): any {
         getBasePath: jest.fn().mockReturnValue('/vault'),
       },
       getFiles: jest.fn().mockReturnValue([]),
+      getAbstractFileByPath: jest.fn().mockReturnValue(null),
     },
     workspace: {
       openLinkText: jest.fn().mockResolvedValue(undefined),
@@ -85,6 +78,13 @@ function makePlugin(overrides: Partial<RagPluginSettings> = {}, app?: any): RagP
   return plugin;
 }
 
+/** Drain queued microtasks (serial scheduler queue) without touching timers. */
+async function flushMicrotasks(hops = 12): Promise<void> {
+  for (let i = 0; i < hops; i++) await Promise.resolve();
+}
+
+const QUIET_MS = 3 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Setup — reset mocks between tests
 // ---------------------------------------------------------------------------
@@ -94,10 +94,11 @@ beforeEach(() => {
   // Ensure real timers between tests (in case a test used fake timers)
   jest.useRealTimers();
 
-  // Default VectorStore mock: ensureLoaded resolves, exists returns true
+  // Default VectorStore mock: metadata checks resolve; no full index load
   (MockVectorStore as jest.Mock).mockImplementation(function(this: any) {
     this.ensureLoaded = jest.fn().mockResolvedValue(undefined);
     this.exists = jest.fn().mockResolvedValue(true);
+    this.peekModel = jest.fn().mockResolvedValue(null);
     this.save = jest.fn().mockResolvedValue(undefined);
     this.query = jest.fn().mockReturnValue([]);
     this.upsertFile = jest.fn();
@@ -114,15 +115,6 @@ beforeEach(() => {
     this.removeFile = jest.fn().mockResolvedValue(undefined);
     this.getFilesToIndex = jest.fn().mockReturnValue([]);
   });
-
-  // IndexProgressModal open is a no-op
-  MockIndexProgressModal.mockImplementation(() => {
-    return { open: jest.fn() } as any;
-  });
-
-  MockRagModal.mockImplementation(() => {
-    return { open: jest.fn() } as any;
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -135,7 +127,17 @@ describe('RagPlugin.onload', () => {
     await plugin.onload();
 
     expect(plugin.vectorStore).toBeDefined();
+    expect(plugin.indexScheduler).toBeDefined();
     expect(MockVectorStore).toHaveBeenCalledTimes(1);
+  });
+
+  test('does NOT eagerly load the index on startup', async () => {
+    const plugin = makePlugin();
+    await plugin.onload();
+    await flushMicrotasks();
+
+    const storeInstance = (MockVectorStore as jest.Mock).mock.instances[0];
+    expect(storeInstance.ensureLoaded).not.toHaveBeenCalled();
   });
 
   test('registers exactly 4 commands', async () => {
@@ -159,29 +161,7 @@ describe('RagPlugin.onload', () => {
     expect(plugin.registerEvent).toHaveBeenCalledTimes(3);
   });
 
-  test('dimension mismatch error shows re-index Notice', async () => {
-    const app = makeApp();
-    const plugin = makePlugin({}, app);
-
-    (MockVectorStore as jest.Mock).mockImplementationOnce(function(this: any) {
-      this.ensureLoaded = jest.fn().mockRejectedValue(
-        new ProviderError('model changed', 'DIMENSION_MISMATCH')
-      );
-      this.exists = jest.fn().mockResolvedValue(true);
-    });
-
-    await plugin.onload();
-    // Allow microtasks to settle
-    await new Promise(resolve => process.nextTick(resolve));
-    await new Promise(resolve => process.nextTick(resolve));
-
-    expect(MockNotice).toHaveBeenCalledWith(
-      expect.stringContaining('re-index'),
-      10000
-    );
-  });
-
-  test('no index found shows first-run guidance Notice', async () => {
+  test('no index found shows first-run guidance Notice without loading the index', async () => {
     const app = makeApp();
     const plugin = makePlugin({}, app);
 
@@ -191,73 +171,89 @@ describe('RagPlugin.onload', () => {
     });
 
     await plugin.onload();
-    await new Promise(resolve => process.nextTick(resolve));
-    await new Promise(resolve => process.nextTick(resolve));
+    await flushMicrotasks();
 
     expect(MockNotice).toHaveBeenCalledWith(
       expect.stringContaining('No index found'),
       8000
     );
+    const storeInstance = (MockVectorStore as jest.Mock).mock.instances[0];
+    expect(storeInstance.ensureLoaded).not.toHaveBeenCalled();
   });
 
-  test('index exists — no first-run Notice shown', async () => {
+  test('index stored with a different model shows re-index Notice via metadata only', async () => {
     const app = makeApp();
     const plugin = makePlugin({}, app);
 
-    // Default mock already has exists returning true
+    (MockVectorStore as jest.Mock).mockImplementationOnce(function(this: any) {
+      this.ensureLoaded = jest.fn().mockResolvedValue(undefined);
+      this.exists = jest.fn().mockResolvedValue(true);
+      this.peekModel = jest.fn().mockResolvedValue('old-model');
+    });
 
     await plugin.onload();
-    await new Promise(resolve => process.nextTick(resolve));
-    await new Promise(resolve => process.nextTick(resolve));
+    await flushMicrotasks();
+
+    expect(MockNotice).toHaveBeenCalledWith(
+      expect.stringContaining('Embedding model changed'),
+      10000
+    );
+    const storeInstance = (MockVectorStore as jest.Mock).mock.instances[0];
+    expect(storeInstance.ensureLoaded).not.toHaveBeenCalled();
+  });
+
+  test('index exists with the same model — no Notice shown', async () => {
+    const plugin = makePlugin();
+    await plugin.onload();
+    await flushMicrotasks();
 
     expect(MockNotice).not.toHaveBeenCalled();
   });
 
-  test('autoIndexOnStartup=false: setTimeout not called with 5000ms delay', async () => {
+});
+
+describe('RagPlugin startup auto-index (quiet window)', () => {
+  test('autoIndexOnStartup=true: index runs only after the quiet window elapses', async () => {
     jest.useFakeTimers();
-    const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
-
-    const plugin = makePlugin({ autoIndexOnStartup: false });
-    await plugin.onload();
-
-    const autoIndexCalls = setTimeoutSpy.mock.calls.filter(
-      call => call[1] === 5000
-    );
-    expect(autoIndexCalls).toHaveLength(0);
-
-    jest.useRealTimers();
-    setTimeoutSpy.mockRestore();
-  });
-
-  test('autoIndexOnStartup=true: setTimeout called with 5000ms delay', async () => {
-    jest.useFakeTimers();
-    const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
-
     const plugin = makePlugin({ autoIndexOnStartup: true });
     await plugin.onload();
+    const indexAllSpy = (MockIndexManager as jest.Mock).mock.instances[0].indexAll as jest.MockedFunction<any>;
 
-    const autoIndexCalls = setTimeoutSpy.mock.calls.filter(
-      call => call[1] === 5000
-    );
-    expect(autoIndexCalls).toHaveLength(1);
+    jest.advanceTimersByTime(QUIET_MS - 60 * 1000);
+    await flushMicrotasks();
+    expect(indexAllSpy).not.toHaveBeenCalled();
+
+    jest.advanceTimersByTime(60 * 1000 + 1);
+    await flushMicrotasks();
+    expect(indexAllSpy).toHaveBeenCalledTimes(1);
 
     jest.useRealTimers();
-    setTimeoutSpy.mockRestore();
+  });
+
+  test('autoIndexOnStartup=false: no auto index after the quiet window', async () => {
+    jest.useFakeTimers();
+    const plugin = makePlugin({ autoIndexOnStartup: false });
+    await plugin.onload();
+    const indexAllSpy = (MockIndexManager as jest.Mock).mock.instances[0].indexAll as jest.MockedFunction<any>;
+
+    jest.advanceTimersByTime(QUIET_MS + 60 * 1000);
+    await flushMicrotasks();
+    expect(indexAllSpy).not.toHaveBeenCalled();
+
+    jest.useRealTimers();
   });
 });
 
 describe('RagPlugin vault event handlers', () => {
-  test('vault delete event calls indexManager.removeFile with file path', async () => {
+  test('vault delete defers indexManager.removeFile until the quiet window', async () => {
+    jest.useFakeTimers();
     const vaultEventMap: VaultEventMap = {};
     const app = makeApp(vaultEventMap);
     const plugin = makePlugin({}, app);
     await plugin.onload();
 
-    // Grab the IndexManager instance created during onload
-    const indexManagerInstance = MockIndexManager.mock.instances[0];
-    const removeFileSpy = indexManagerInstance.removeFile as jest.MockedFunction<any>;
+    const removeFileSpy = (MockIndexManager as jest.Mock).mock.instances[0].removeFile as jest.MockedFunction<any>;
 
-    // Simulate vault 'delete' event
     const fakeFile = {
       path: 'notes/deleted.md',
       name: 'deleted.md',
@@ -266,19 +262,24 @@ describe('RagPlugin vault event handlers', () => {
       stat: { mtime: 0, size: 0, ctime: 0 },
     };
     vaultEventMap['delete']?.(fakeFile);
-    await new Promise(resolve => process.nextTick(resolve));
+    await flushMicrotasks();
+    expect(removeFileSpy).not.toHaveBeenCalled();
 
+    jest.advanceTimersByTime(QUIET_MS);
+    await flushMicrotasks();
     expect(removeFileSpy).toHaveBeenCalledWith('notes/deleted.md');
+
+    jest.useRealTimers();
   });
 
-  test('vault rename event calls indexManager.removeFile with old path', async () => {
+  test('vault rename defers old-path removal until the quiet window', async () => {
+    jest.useFakeTimers();
     const vaultEventMap: VaultEventMap = {};
     const app = makeApp(vaultEventMap);
     const plugin = makePlugin({}, app);
     await plugin.onload();
 
-    const indexManagerInstance = MockIndexManager.mock.instances[0];
-    const removeFileSpy = indexManagerInstance.removeFile as jest.MockedFunction<any>;
+    const removeFileSpy = (MockIndexManager as jest.Mock).mock.instances[0].removeFile as jest.MockedFunction<any>;
 
     const fakeFile = {
       path: 'notes/new-name.md',
@@ -288,41 +289,24 @@ describe('RagPlugin vault event handlers', () => {
       stat: { mtime: 0, size: 0, ctime: 0 },
     };
     vaultEventMap['rename']?.(fakeFile, 'notes/old-name.md');
-    await new Promise(resolve => process.nextTick(resolve));
+    await flushMicrotasks();
+    expect(removeFileSpy).not.toHaveBeenCalled();
 
+    jest.advanceTimersByTime(QUIET_MS);
+    await flushMicrotasks();
     expect(removeFileSpy).toHaveBeenCalledWith('notes/old-name.md');
+
+    jest.useRealTimers();
   });
 
-  test('vault modify event does NOT call indexCurrentFile when autoIndexOnStartup=false', async () => {
-    const vaultEventMap: VaultEventMap = {};
-    const app = makeApp(vaultEventMap);
-    const plugin = makePlugin({ autoIndexOnStartup: false }, app);
-    await plugin.onload();
-
-    const indexManagerInstance = MockIndexManager.mock.instances[0];
-    const indexCurrentFileSpy = indexManagerInstance.indexCurrentFile as jest.MockedFunction<any>;
-
-    const fakeFile = {
-      path: 'notes/changed.md',
-      name: 'changed.md',
-      extension: 'md',
-      basename: 'changed',
-      stat: { mtime: 1000, size: 100, ctime: 0 },
-    };
-    vaultEventMap['modify']?.(fakeFile);
-    await new Promise(resolve => process.nextTick(resolve));
-
-    expect(indexCurrentFileSpy).not.toHaveBeenCalled();
-  });
-
-  test('vault modify event calls indexCurrentFile when autoIndexOnStartup=true and file is md', async () => {
+  test('vault modify queues an auto index pass that runs after the quiet window', async () => {
+    jest.useFakeTimers();
     const vaultEventMap: VaultEventMap = {};
     const app = makeApp(vaultEventMap);
     const plugin = makePlugin({ autoIndexOnStartup: true }, app);
     await plugin.onload();
 
-    const indexManagerInstance = MockIndexManager.mock.instances[0];
-    const indexCurrentFileSpy = indexManagerInstance.indexCurrentFile as jest.MockedFunction<any>;
+    const indexAllSpy = (MockIndexManager as jest.Mock).mock.instances[0].indexAll as jest.MockedFunction<any>;
 
     const fakeFile = {
       path: 'notes/changed.md',
@@ -332,11 +316,56 @@ describe('RagPlugin vault event handlers', () => {
       stat: { mtime: 1000, size: 100, ctime: 0 },
     };
     vaultEventMap['modify']?.(fakeFile);
-    await new Promise(resolve => process.nextTick(resolve));
+    await flushMicrotasks();
+    expect(indexAllSpy).not.toHaveBeenCalled();
 
-    expect(indexCurrentFileSpy).toHaveBeenCalledWith(
-      fakeFile,
-      expect.objectContaining({ autoIndexOnStartup: true })
+    jest.advanceTimersByTime(QUIET_MS);
+    await flushMicrotasks();
+    expect(indexAllSpy).toHaveBeenCalledTimes(1);
+
+    jest.useRealTimers();
+  });
+
+  test('vault modify does NOT auto-index when autoIndexOnStartup=false', async () => {
+    jest.useFakeTimers();
+    const vaultEventMap: VaultEventMap = {};
+    const app = makeApp(vaultEventMap);
+    const plugin = makePlugin({ autoIndexOnStartup: false }, app);
+    await plugin.onload();
+
+    const indexAllSpy = (MockIndexManager as jest.Mock).mock.instances[0].indexAll as jest.MockedFunction<any>;
+
+    const fakeFile = {
+      path: 'notes/changed.md',
+      name: 'changed.md',
+      extension: 'md',
+      basename: 'changed',
+      stat: { mtime: 1000, size: 100, ctime: 0 },
+    };
+    vaultEventMap['modify']?.(fakeFile);
+
+    jest.advanceTimersByTime(QUIET_MS + 60 * 1000);
+    await flushMicrotasks();
+    expect(indexAllSpy).not.toHaveBeenCalled();
+
+    jest.useRealTimers();
+  });
+});
+
+describe('RagPlugin manual index', () => {
+  test('indexAll() runs a full pass immediately when no chat is active or recent', async () => {
+    const plugin = makePlugin();
+    await plugin.onload();
+
+    const indexAllSpy = (MockIndexManager as jest.Mock).mock.instances[0].indexAll as jest.MockedFunction<any>;
+
+    await plugin.indexAll();
+    await flushMicrotasks();
+
+    expect(indexAllSpy).toHaveBeenCalledTimes(1);
+    expect(MockNotice).toHaveBeenCalledWith(
+      expect.stringContaining('Done'),
+      5000
     );
   });
 });

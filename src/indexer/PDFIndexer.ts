@@ -75,7 +75,7 @@ export class PDFIndexer {
     }
 
     // Step 7: Upsert to store
-    this.vectorStore.upsertFile(file.path, file.stat.mtime, allChunks);
+    await this.vectorStore.upsertFile(file.path, file.stat.mtime, allChunks);
 
     // Step 8: Return result
     return {

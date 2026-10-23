@@ -17,8 +17,26 @@ interface MockPlugin {
   settings: RagPluginSettings;
   saveSettings: () => Promise<void>;
   indexAll: () => Promise<void>;
+  clearIndex: () => Promise<void>;
   manifest: { dir: string };
-  vectorStore: { clear: (model: string) => Promise<void> };
+  indexScheduler: {
+    getStatus: () => {
+      indexing: boolean;
+      queued: { changes: number; removals: number; fullPass: boolean; clear: boolean };
+      lastRun: {
+        kind: 'auto' | 'manual' | 'file';
+        indexed: number;
+        skipped: number;
+        failed: number;
+        path?: string;
+        error?: string;
+        finishedAt: number;
+      } | null;
+    };
+  };
+  vectorStore: {
+    peekStats: () => Promise<{ fileCount: number; chunkCount: number; embeddingModel: string; updatedAt: string } | null>;
+  };
 }
 
 function makeMockPlugin(settingOverrides: Partial<RagPluginSettings> = {}): MockPlugin {
@@ -26,8 +44,18 @@ function makeMockPlugin(settingOverrides: Partial<RagPluginSettings> = {}): Mock
     settings: { ...DEFAULT_SETTINGS, ...settingOverrides },
     saveSettings: jest.fn().mockResolvedValue(undefined),
     indexAll: jest.fn().mockResolvedValue(undefined),
+    clearIndex: jest.fn().mockResolvedValue(undefined),
     manifest: { dir: '.obsidian/plugins/obsidian-rag' },
-    vectorStore: { clear: jest.fn().mockResolvedValue(undefined) },
+    indexScheduler: {
+      getStatus: () => ({
+        indexing: false,
+        queued: { changes: 0, removals: 0, fullPass: false, clear: false },
+        lastRun: null,
+      }),
+    },
+    vectorStore: {
+      peekStats: () => Promise.resolve({ fileCount: 10, chunkCount: 55, embeddingModel: 'm', updatedAt: new Date().toISOString() }),
+    },
   };
 }
 
@@ -394,4 +422,126 @@ describe('RagSettingTab', () => {
     expect(mockPlugin.settings.chunkSize).toBe(750);
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
   });
+
+  test('Test Connection: releases the embedder worker after the round-trip', async () => {
+    const dispose = jest.fn().mockResolvedValue(undefined);
+    const mockEmbedder = {
+      ping: jest.fn().mockResolvedValue({ reachable: true, latencyMs: 10 }),
+      embed: jest.fn().mockResolvedValue({ embeddings: [[0.1]], dimension: 1 }),
+      listModels: mockListModels,
+      dispose,
+    };
+    // First call = embedding model dropdown; second = the Test button's embedder.
+    mockCreateEmbedder.mockReturnValueOnce({ listModels: mockListModels } as any);
+    mockCreateEmbedder.mockReturnValue(mockEmbedder as any);
+
+    const settings = captureSettingCallbacks(tab);
+    const btn = byName(settings, 'Test Connection');
+
+    await btn.onClickButton!();
+
+    expect(mockEmbedder.embed).toHaveBeenCalledWith(['test']);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  test('Test Connection: releases the embedder worker even when the round-trip fails', async () => {
+    const dispose = jest.fn().mockResolvedValue(undefined);
+    const mockEmbedder = {
+      ping: jest.fn().mockResolvedValue({ reachable: true, latencyMs: 10 }),
+      embed: jest.fn().mockRejectedValue(new Error('boom')),
+      listModels: mockListModels,
+      dispose,
+    };
+    mockCreateEmbedder.mockReturnValueOnce({ listModels: mockListModels } as any);
+    mockCreateEmbedder.mockReturnValue(mockEmbedder as any);
+
+    const settings = captureSettingCallbacks(tab);
+    const btn = byName(settings, 'Test Connection');
+
+    await btn.onClickButton!();
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  test('Index Status: Clear button routes through plugin.clearIndex (serial queue), not the store directly', async () => {
+    const originalConfirm = (globalThis as any).confirm;
+    (globalThis as any).confirm = jest.fn().mockReturnValue(true);
+    try {
+      const settings = captureSettingCallbacks(tab);
+      const btn = byName(settings, 'Index Status');
+
+      await btn.onClickButton!();
+
+      expect(mockPlugin.clearIndex).toHaveBeenCalledTimes(1);
+    } finally {
+      (globalThis as any).confirm = originalConfirm;
+    }
+  });
+
+  const summary = () => (tab as any).indexStatusSummary() as Promise<string>;
+
+  test('Index Status: summary shows an in-flight run first', async () => {
+    mockPlugin.indexScheduler = {
+      getStatus: () => ({
+        indexing: true,
+        queued: { changes: 0, removals: 0, fullPass: false, clear: false },
+        lastRun: null,
+      }),
+    };
+    expect(await summary()).toContain('Indexing in progress');
+  });
+
+  test('Index Status: summary lists queued work when nothing is running', async () => {
+    mockPlugin.indexScheduler = {
+      getStatus: () => ({
+        indexing: false,
+        queued: { changes: 3, removals: 1, fullPass: true, clear: false },
+        lastRun: null,
+      }),
+    };
+    expect(await summary()).toBe(
+      'Queued (runs after the quiet window): full re-index, 3 changed files, 1 removal.'
+    );
+  });
+
+  test('Index Status: summary reports up-to-date with the last completed run', async () => {
+    mockPlugin.indexScheduler = {
+      getStatus: () => ({
+        indexing: false,
+        queued: { changes: 0, removals: 0, fullPass: false, clear: false },
+        lastRun: { kind: 'manual', indexed: 2, skipped: 5, failed: 0, finishedAt: Date.now() - 60000 },
+      }),
+    };
+    const text = await summary();
+    expect(text).toContain('Index is up to date — 10 files, 55 chunks');
+    expect(text).toContain('2 indexed, 5 skipped');
+  });
+
+  test('Index Status: summary reports a failed last run', async () => {
+    mockPlugin.indexScheduler = {
+      getStatus: () => ({
+        indexing: false,
+        queued: { changes: 0, removals: 0, fullPass: false, clear: false },
+        lastRun: { kind: 'auto', indexed: 0, skipped: 0, failed: 0, error: 'boom', finishedAt: Date.now() - 60000 },
+      }),
+    };
+    const text = await summary();
+    expect(text).toContain('Index is up to date — 10 files, 55 chunks');
+    expect(text).toContain('failed: boom');
+  });
+
+  test('Index Status: summary offers Re-index when no index exists', async () => {
+    mockPlugin.vectorStore = {
+      peekStats: () => Promise.resolve(null),
+    };
+    expect(await summary()).toBe('No index yet — run Re-index to build one.');
+  });
+
+  test('Index Status: summary treats an empty index as no index', async () => {
+    mockPlugin.vectorStore = {
+      peekStats: () => Promise.resolve({ fileCount: 0, chunkCount: 0, embeddingModel: 'm', updatedAt: new Date().toISOString() }),
+    };
+    expect(await summary()).toBe('No index yet — run Re-index to build one.');
+  });
+
 });
