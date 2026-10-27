@@ -4,6 +4,7 @@ import {
   applyCliPreset,
   expandCliTemplate,
   extractCliAnswer,
+  extractCliError,
   resolveCliCommand,
   tokenizeCliTemplate,
 } from './cli';
@@ -133,6 +134,44 @@ describe('extractCliAnswer', () => {
   });
 });
 
+describe('extractCliError', () => {
+  test('omp stopReason error event: errorMessage wins over stderr noise', () => {
+    const output = [
+      JSON.stringify({ type: 'session', id: 'abc', cwd: '/tmp/x' }),
+      JSON.stringify({ type: 'message_start', message: { role: 'assistant', content: [], stopReason: 'error', errorStatus: 400, errorMessage: '400 The requested model is not available for integrator "opencode".' } }),
+      JSON.stringify({ type: 'turn_end', message: { role: 'assistant', content: [], stopReason: 'error', errorStatus: 400, errorMessage: '400 The requested model is not available for integrator "opencode".' } }),
+    ].join('\n');
+    expect(extractCliError(output)).toBe('400 The requested model is not available for integrator "opencode".');
+  });
+
+  test('top-level errorMessage string is returned', () => {
+    const output = JSON.stringify({ type: 'error', errorMessage: 'no such model' });
+    expect(extractCliError(output)).toBe('no such model');
+  });
+
+  test('nested error.message object is returned', () => {
+    const output = JSON.stringify({ error: { message: 'invalid API key' } });
+    expect(extractCliError(output)).toBe('invalid API key');
+  });
+
+  test('non-error JSON lines yield null (fall through to raw stderr/stdout)', () => {
+    const output = [
+      JSON.stringify({ type: 'session', id: 'abc' }),
+      JSON.stringify({ type: 'agent_end', messages: [] }),
+    ].join('\n');
+    expect(extractCliError(output)).toBeNull();
+  });
+
+  test('long errorMessage is truncated to 300 chars', () => {
+    const output = JSON.stringify({ errorMessage: 'x'.repeat(500) });
+    expect(extractCliError(output)).toHaveLength(300);
+  });
+
+  test('empty output yields null', () => {
+    expect(extractCliError('')).toBeNull();
+  });
+});
+
 describe('resolveCliCommand', () => {
   test('existing absolute path is returned as-is', () => {
     expect(resolveCliCommand(process.execPath)).toBe(process.execPath);
@@ -221,6 +260,16 @@ describe('CliChatProvider', () => {
     ).rejects.toThrow(/exited with code 3: boom/);
   });
 
+  test('chat: non-zero exit with structured stdout error surfaces the errorMessage, not the raw stream', async () => {
+    const provider = new CliChatProvider(
+      "node -e 'console.log(JSON.stringify({type:\"turn_end\",stopReason:\"error\",errorStatus:400,errorMessage:\"model not available for integrator\"})); process.exit(1)' {prompt}"
+    );
+
+    await expect(
+      provider.chat([{ role: 'user', content: 'hi' }], new AbortController().signal)
+    ).rejects.toThrow(/exited with code 1: model not available for integrator/);
+  });
+
   test('chat: missing command throws CONNECTION_REFUSED', async () => {
     const provider = new CliChatProvider('definitely-not-a-real-cmd-xyz {prompt}');
 
@@ -248,6 +297,18 @@ describe('CliChatProvider', () => {
     await expect(
       provider.chat([{ role: 'user', content: 'hi' }], new AbortController().signal)
     ).rejects.toMatchObject({ code: 'UNEXPECTED_RESPONSE' });
+  });
+
+  test('chat: NUL byte in prompt (PDF text) does not crash spawn', async () => {
+    const provider = new CliChatProvider('/bin/echo {prompt}');
+
+    const result = await provider.chat(
+      [{ role: 'user', content: 'context' + '\u0000' + 'here' + '\n\n' + 'question' }],
+      new AbortController().signal
+    );
+
+    // The NUL is stripped; the rest of the prompt reaches the CLI intact.
+    expect(result).toBe('contexthere' + '\n\n' + 'question');
   });
 
   test('ping: round-trip probe returns reachable with the extracted reply', async () => {

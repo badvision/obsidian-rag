@@ -270,6 +270,51 @@ export function extractCliAnswer(stdout: string): string {
   return trimmed;
 }
 
+/**
+ * Pull a human-readable error out of CLI stdout.
+ * Agent CLIs (omp --mode json) print their error stream as NDJSON on
+ * stdout even when stderr is empty, so the raw dump is unreadable.
+ * Prefers events with stopReason 'error' carrying an errorMessage
+ * (omp), then falls back to a top-level errorMessage/error field.
+ * Returns null when nothing recognizable is found.
+ */
+export function extractCliError(stdout: string): string | null {
+  const lines = stdout.split('\n').map(l => l.trim()).filter(Boolean);
+  const plain: string[] = [];
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.startsWith('{') && !line.startsWith('[')) continue;
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { continue; }
+    const top = (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
+      ? parsed as Record<string, unknown> : null;
+    if (!top) continue;
+    // Agent CLIs (omp) nest stopReason/errorMessage on the message object.
+    const message = (top['message'] && typeof top['message'] === 'object')
+      ? top['message'] as Record<string, unknown> : null;
+    for (const scope of [top, message]) {
+      if (!scope) continue;
+      if (scope['stopReason'] === 'error') {
+        const msg = typeof scope['errorMessage'] === 'string' ? scope['errorMessage'] : '';
+        if (msg.trim()) return msg.trim().slice(0, 300);
+      }
+    }
+    for (const scope of [top, message]) {
+      if (!scope) continue;
+      for (const field of ['errorMessage', 'error']) {
+        const candidate = scope[field];
+        if (typeof candidate === 'string' && candidate.trim()) plain.push(candidate.trim());
+        else if (candidate && typeof candidate === 'object') {
+          const nested = candidate as Record<string, unknown>;
+          const nestedMsg = typeof nested['message'] === 'string' ? nested['message'] : '';
+          if (nestedMsg.trim()) plain.push(nestedMsg.trim());
+        }
+      }
+    }
+  }
+  return plain.length > 0 ? plain[plain.length - 1].slice(0, 300) : null;
+}
+
 /** Probe prompt used by ping() to verify a real round-trip. */
 export const CLI_PROBE_PROMPT = 'Reply with exactly one word: PONG';
 
@@ -397,9 +442,15 @@ export class CliChatProvider implements IChatProvider {
     signal: AbortSignal,
     onToken?: (token: string) => void
   ): Promise<string> {
-    const system = messages.find(m => m.role === 'system')?.content ?? '';
-    const question = [...messages].reverse().find(m => m.role === 'user')?.content ?? '';
-    const prompt = messages.map(m => m.content).join('\n\n');
+    // child_process.spawn rejects any argv element containing a NUL byte,
+    // and the whole prompt becomes a single argument. Vault text (PDF text
+    // extraction) can carry \u0000 for glyphs without a Unicode mapping; an
+    // un-stripped NUL would crash the run while Test Connection (a fixed
+    // probe string) still passes.
+    const stripNul = (s: string) => s.replace(/\u0000/g, '');
+    const system = stripNul(messages.find(m => m.role === 'system')?.content ?? '');
+    const question = stripNul([...messages].reverse().find(m => m.role === 'user')?.content ?? '');
+    const prompt = stripNul(messages.map(m => m.content).join('\n\n'));
 
     const result = await this.run({ prompt, system, question, tmpdir: '' }, signal, this.timeoutMs);
 
@@ -413,7 +464,7 @@ export class CliChatProvider implements IChatProvider {
       );
     }
     if (result.code !== 0) {
-      const detail = (result.stderr || result.stdout).trim().slice(0, 300);
+      const detail = extractCliError(result.stdout) ?? (result.stderr || result.stdout).trim().slice(0, 300);
       throw new ProviderError(
         `CLI exited with code ${result.code}${detail ? `: ${detail}` : ''}`,
         'UNEXPECTED_RESPONSE'

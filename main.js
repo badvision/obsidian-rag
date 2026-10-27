@@ -60,7 +60,7 @@ var http = require("http");
 var https = require("https");
 function nodeStreamPost(opts) {
   return new Promise((resolve, reject) => {
-    const { url, body, signal, onLine } = opts;
+    const { url, body, signal, headers: extraHeaders, onLine } = opts;
     const parsed = new URL(url);
     const lib = parsed.protocol === "https:" ? https : http;
     const req = lib.request(
@@ -71,7 +71,8 @@ function nodeStreamPost(opts) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body)
+          "Content-Length": Buffer.byteLength(body),
+          ...extraHeaders
         }
       },
       (res) => {
@@ -122,17 +123,21 @@ function nodeStreamPost(opts) {
 }
 
 // src/providers/ollama.ts
+function authHeaders(apiKey) {
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : void 0;
+}
 var OllamaEmbedder = class {
-  constructor(baseUrl, embeddingModel) {
+  constructor(baseUrl, embeddingModel, apiKey) {
     this.baseUrl = baseUrl;
     this.embeddingModel = embeddingModel;
+    this.auth = authHeaders(apiKey);
   }
   async embed(texts) {
     try {
       const response = await (0, import_obsidian.requestUrl)({
         url: `${this.baseUrl}/api/embed`,
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...this.auth },
         body: JSON.stringify({ model: this.embeddingModel, input: texts }),
         throw: false
       });
@@ -158,7 +163,7 @@ var OllamaEmbedder = class {
         const response = await (0, import_obsidian.requestUrl)({
           url: `${this.baseUrl}/api/embeddings`,
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...this.auth },
           body: JSON.stringify({ model: this.embeddingModel, prompt: text }),
           throw: false
         });
@@ -185,6 +190,7 @@ var OllamaEmbedder = class {
       const response = await (0, import_obsidian.requestUrl)({
         url: `${this.baseUrl}/api/tags`,
         method: "GET",
+        headers: this.auth,
         throw: false
       });
       if (response.status < 200 || response.status >= 300) return [];
@@ -200,6 +206,7 @@ var OllamaEmbedder = class {
       const response = await (0, import_obsidian.requestUrl)({
         url: `${this.baseUrl}/api/version`,
         method: "GET",
+        headers: this.auth,
         throw: false
       });
       const latencyMs = Date.now() - start;
@@ -213,9 +220,10 @@ var OllamaEmbedder = class {
   }
 };
 var OllamaChatProvider = class {
-  constructor(baseUrl, chatModel) {
+  constructor(baseUrl, chatModel, apiKey) {
     this.baseUrl = baseUrl;
     this.chatModel = chatModel;
+    this.auth = authHeaders(apiKey);
   }
   async chat(messages, signal, onToken) {
     const body = JSON.stringify({ model: this.chatModel, messages, stream: true });
@@ -225,6 +233,7 @@ var OllamaChatProvider = class {
         url: `${this.baseUrl}/api/chat`,
         body,
         signal,
+        headers: this.auth,
         onLine: (line) => {
           try {
             const obj = JSON.parse(line);
@@ -255,6 +264,7 @@ var OllamaChatProvider = class {
       const response = await (0, import_obsidian.requestUrl)({
         url: `${this.baseUrl}/api/tags`,
         method: "GET",
+        headers: this.auth,
         throw: false
       });
       if (response.status < 200 || response.status >= 300) return [];
@@ -270,6 +280,7 @@ var OllamaChatProvider = class {
       const response = await (0, import_obsidian.requestUrl)({
         url: `${this.baseUrl}/api/version`,
         method: "GET",
+        headers: this.auth,
         throw: false
       });
       const latencyMs = Date.now() - start;
@@ -285,17 +296,21 @@ var OllamaChatProvider = class {
 
 // src/providers/lmstudio.ts
 var import_obsidian2 = require("obsidian");
+function authHeaders2(apiKey) {
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : void 0;
+}
 var LMStudioEmbedder = class {
-  constructor(baseUrl, embeddingModel) {
+  constructor(baseUrl, embeddingModel, apiKey) {
     this.baseUrl = baseUrl;
     this.embeddingModel = embeddingModel;
+    this.auth = authHeaders2(apiKey);
   }
   async embed(texts) {
     try {
       const response = await (0, import_obsidian2.requestUrl)({
         url: `${this.baseUrl}/v1/embeddings`,
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...this.auth },
         body: JSON.stringify({ model: this.embeddingModel, input: texts }),
         throw: false
       });
@@ -324,6 +339,7 @@ var LMStudioEmbedder = class {
       const response = await (0, import_obsidian2.requestUrl)({
         url: `${this.baseUrl}/v1/models`,
         method: "GET",
+        headers: this.auth,
         throw: false
       });
       if (response.status < 200 || response.status >= 300) return [];
@@ -339,6 +355,7 @@ var LMStudioEmbedder = class {
       const response = await (0, import_obsidian2.requestUrl)({
         url: `${this.baseUrl}/v1/models`,
         method: "GET",
+        headers: this.auth,
         throw: false
       });
       const latencyMs = Date.now() - start;
@@ -352,9 +369,10 @@ var LMStudioEmbedder = class {
   }
 };
 var LMStudioChatProvider = class {
-  constructor(baseUrl, chatModel) {
+  constructor(baseUrl, chatModel, apiKey) {
     this.baseUrl = baseUrl;
     this.chatModel = chatModel;
+    this.auth = authHeaders2(apiKey);
   }
   async chat(messages, signal, onToken) {
     const body = JSON.stringify({ model: this.chatModel, messages, stream: true });
@@ -365,6 +383,7 @@ var LMStudioChatProvider = class {
         url: `${this.baseUrl}/v1/chat/completions`,
         body,
         signal,
+        headers: this.auth,
         onLine: (line) => {
           if (done) return;
           const trimmed = line.trim();
@@ -403,6 +422,7 @@ var LMStudioChatProvider = class {
       const response = await (0, import_obsidian2.requestUrl)({
         url: `${this.baseUrl}/v1/models`,
         method: "GET",
+        headers: this.auth,
         throw: false
       });
       if (response.status < 200 || response.status >= 300) return [];
@@ -418,6 +438,7 @@ var LMStudioChatProvider = class {
       const response = await (0, import_obsidian2.requestUrl)({
         url: `${this.baseUrl}/v1/models`,
         method: "GET",
+        headers: this.auth,
         throw: false
       });
       const latencyMs = Date.now() - start;
@@ -613,6 +634,43 @@ function extractCliAnswer(stdout) {
   }
   return trimmed;
 }
+function extractCliError(stdout) {
+  const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  const plain = [];
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.startsWith("{") && !line.startsWith("[")) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const top = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+    if (!top) continue;
+    const message = top["message"] && typeof top["message"] === "object" ? top["message"] : null;
+    for (const scope of [top, message]) {
+      if (!scope) continue;
+      if (scope["stopReason"] === "error") {
+        const msg = typeof scope["errorMessage"] === "string" ? scope["errorMessage"] : "";
+        if (msg.trim()) return msg.trim().slice(0, 300);
+      }
+    }
+    for (const scope of [top, message]) {
+      if (!scope) continue;
+      for (const field of ["errorMessage", "error"]) {
+        const candidate = scope[field];
+        if (typeof candidate === "string" && candidate.trim()) plain.push(candidate.trim());
+        else if (candidate && typeof candidate === "object") {
+          const nested = candidate;
+          const nestedMsg = typeof nested["message"] === "string" ? nested["message"] : "";
+          if (nestedMsg.trim()) plain.push(nestedMsg.trim());
+        }
+      }
+    }
+  }
+  return plain.length > 0 ? plain[plain.length - 1].slice(0, 300) : null;
+}
 var CLI_PROBE_PROMPT = "Reply with exactly one word: PONG";
 var _CliChatProvider = class _CliChatProvider {
   constructor(template, timeoutMs = _CliChatProvider.DEFAULT_TIMEOUT_MS) {
@@ -711,9 +769,10 @@ var _CliChatProvider = class _CliChatProvider {
     }
   }
   async chat(messages, signal, onToken) {
-    const system = messages.find((m) => m.role === "system")?.content ?? "";
-    const question = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
-    const prompt = messages.map((m) => m.content).join("\n\n");
+    const stripNul = (s) => s.replace(/\u0000/g, "");
+    const system = stripNul(messages.find((m) => m.role === "system")?.content ?? "");
+    const question = stripNul([...messages].reverse().find((m) => m.role === "user")?.content ?? "");
+    const prompt = stripNul(messages.map((m) => m.content).join("\n\n"));
     const result = await this.run({ prompt, system, question, tmpdir: "" }, signal, this.timeoutMs);
     if (result.aborted) {
       throw new ProviderError("Stream aborted", "STREAM_ABORTED");
@@ -725,7 +784,7 @@ var _CliChatProvider = class _CliChatProvider {
       );
     }
     if (result.code !== 0) {
-      const detail = (result.stderr || result.stdout).trim().slice(0, 300);
+      const detail = extractCliError(result.stdout) ?? (result.stderr || result.stdout).trim().slice(0, 300);
       throw new ProviderError(
         `CLI exited with code ${result.code}${detail ? `: ${detail}` : ""}`,
         "UNEXPECTED_RESPONSE"
@@ -1661,7 +1720,7 @@ function delayMs(ms) {
 // src/providers/factory.ts
 function createEmbedder(settings, pluginDir, onProgress) {
   if (settings.embeddingProvider === "lmstudio") {
-    return new LMStudioEmbedder(settings.embeddingBaseUrl, settings.embeddingModel);
+    return new LMStudioEmbedder(settings.embeddingBaseUrl, settings.embeddingModel, settings.embeddingApiKey);
   }
   if (settings.embeddingProvider === "onnx") {
     return new OnnxEmbedder({
@@ -1671,26 +1730,28 @@ function createEmbedder(settings, pluginDir, onProgress) {
       device: settings.onnxDevice
     });
   }
-  return new OllamaEmbedder(settings.embeddingBaseUrl, settings.embeddingModel);
+  return new OllamaEmbedder(settings.embeddingBaseUrl, settings.embeddingModel, settings.embeddingApiKey);
 }
 function createChatProvider(settings) {
   if (settings.chatProvider === "lmstudio") {
-    return new LMStudioChatProvider(settings.chatBaseUrl, settings.chatModel);
+    return new LMStudioChatProvider(settings.chatBaseUrl, settings.chatModel, settings.chatApiKey);
   }
   if (settings.chatProvider === "cli") {
     return new CliChatProvider(settings.cliTemplate);
   }
-  return new OllamaChatProvider(settings.chatBaseUrl, settings.chatModel);
+  return new OllamaChatProvider(settings.chatBaseUrl, settings.chatModel, settings.chatApiKey);
 }
 
 // src/settings.ts
 var DEFAULT_SETTINGS = {
   embeddingProvider: "ollama",
   embeddingBaseUrl: "http://localhost:11434",
+  embeddingApiKey: "",
   embeddingModel: "nomic-embed-text",
   onnxDevice: "cpu",
   chatProvider: "ollama",
   chatBaseUrl: "http://localhost:11434",
+  chatApiKey: "",
   chatModel: "llama3.2",
   cliPreset: "opencode",
   cliTemplate: CLI_PRESETS.opencode,
@@ -1796,6 +1857,12 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
+      new import_obsidian3.Setting(containerEl).setName("Embedding API Key").setDesc("Optional. Sent as a Bearer token \u2014 for remote Ollama / LM Studio endpoints that require auth").addText(
+        (text) => text.setValue(this.plugin.settings.embeddingApiKey).onChange(async (value) => {
+          this.plugin.settings.embeddingApiKey = value;
+          await this.plugin.saveSettings();
+        })
+      );
     }
     this.addModelDropdown(
       containerEl,
@@ -1842,6 +1909,12 @@ var RagSettingTab = class extends import_obsidian3.PluginSettingTab {
       new import_obsidian3.Setting(containerEl).setName("Chat Base URL").setDesc("Chat provider endpoint URL").addText(
         (text) => text.setValue(this.plugin.settings.chatBaseUrl).onChange(async (value) => {
           this.plugin.settings.chatBaseUrl = value;
+          await this.plugin.saveSettings();
+        })
+      );
+      new import_obsidian3.Setting(containerEl).setName("Chat API Key").setDesc("Optional. Sent as a Bearer token \u2014 for remote Ollama / LM Studio endpoints that require auth").addText(
+        (text) => text.setValue(this.plugin.settings.chatApiKey).onChange(async (value) => {
+          this.plugin.settings.chatApiKey = value;
           await this.plugin.saveSettings();
         })
       );
@@ -5700,7 +5773,7 @@ var RagView = class extends import_obsidian5.ItemView {
       switch (err.code) {
         case "CONNECTION_REFUSED":
           if (this.settings.chatProvider === "cli") {
-            return "CLI command failed \u2014 check the CLI Command template in settings and use Test Connection to debug it.";
+            return `CLI command failed: ${err.message} \u2014 check the CLI Command template in settings and use Test Connection to debug.`;
           }
           return `Cannot connect to ${this.settings.chatBaseUrl}. Is Ollama / LM Studio running?`;
         case "MODEL_NOT_FOUND":

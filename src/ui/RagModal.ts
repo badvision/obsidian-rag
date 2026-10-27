@@ -164,7 +164,7 @@ export class RagModal extends Modal {
       switch (err.code) {
         case 'CONNECTION_REFUSED':
           if (this.settings.chatProvider === 'cli') {
-            return 'CLI command failed — check the CLI Command template in settings and use Test Connection to debug it.';
+            return `CLI command failed: ${(err as Error).message} — check the CLI Command template in settings and use Test Connection to debug.`;
           }
           return `Cannot connect to provider at ${this.settings.chatBaseUrl}. Make sure Ollama or LM Studio is running.`;
         case 'MODEL_NOT_FOUND':

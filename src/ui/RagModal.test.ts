@@ -110,6 +110,16 @@ describe('RagModal', () => {
     expect(msg).toContain('Cannot connect');
   });
 
+  test('getErrorMessage: CLI CONNECTION_REFUSED surfaces the provider detail', () => {
+    const settings: RagPluginSettings = { ...DEFAULT_SETTINGS, chatProvider: 'cli' };
+    const cliModal = new RagModal(mockApp, mockQueryService, settings);
+    cliModal.onOpen();
+    const err = new ProviderError('Failed to launch /opt/homebrew/bin/omp: E2BIG', 'CONNECTION_REFUSED');
+    const msg = cliModal.getErrorMessage(err);
+    expect(msg).toContain('CLI command failed');
+    expect(msg).toContain('Failed to launch /opt/homebrew/bin/omp: E2BIG');
+  });
+
   test('getErrorMessage: MODEL_NOT_FOUND → contains "not found"', () => {
     const err = new ProviderError('model missing', 'MODEL_NOT_FOUND');
     const msg = modal.getErrorMessage(err);

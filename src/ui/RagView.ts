@@ -250,7 +250,7 @@ export class RagView extends ItemView {
       switch (err.code) {
         case 'CONNECTION_REFUSED':
           if (this.settings.chatProvider === 'cli') {
-            return 'CLI command failed — check the CLI Command template in settings and use Test Connection to debug it.';
+            return `CLI command failed: ${(err as Error).message} — check the CLI Command template in settings and use Test Connection to debug.`;
           }
           return `Cannot connect to ${this.settings.chatBaseUrl}. Is Ollama / LM Studio running?`;
         case 'MODEL_NOT_FOUND':
