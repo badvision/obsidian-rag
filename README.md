@@ -100,7 +100,7 @@ Open **Settings → Obsidian RAG** after enabling the plugin.
 
 The embedding and chat roles are configured **independently** — you can embed locally and chat through a CLI (or vice versa).
 
-**Embeddings** — *Ollama*, *LM Studio / MLX*, or *Self-hosted ONNX* (no server; model runs in a managed worker, downloaded once and cached in the plugin folder). Server providers each have their own Base URL (default `http://localhost:11434` / `http://localhost:1234`).
+**Embeddings** — *Ollama*, *LM Studio / MLX*, or *Self-hosted ONNX* (no server; model runs in a managed worker, downloaded once and cached in the plugin folder). Server providers each have their own Base URL (default `http://localhost:11434` / `http://localhost:1234`) and an optional API key (sent as a `Bearer` token, for remote endpoints that require auth).
 
 **Chat** — *Ollama*, *LM Studio / MLX*, or *CLI*.
 

@@ -110,6 +110,27 @@ describe('OllamaEmbedder', () => {
     expect(result.latencyMs).toBe(0);
     expect(result.errorMessage).toBeDefined();
   });
+
+  test('embed: sends Authorization Bearer header when an API key is set', async () => {
+    const keyed = new OllamaEmbedder('http://localhost:11434', 'nomic-embed-text', 'sekret');
+    globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse(200, { embeddings: [[0.1, 0.2, 0.3]] }));
+
+    await keyed.embed(['hello']);
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      'http://localhost:11434/api/embed',
+      expect.objectContaining({ headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sekret' } })
+    );
+  });
+
+  test('embed: no Authorization header when no API key is set', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValue(jsonResponse(200, { embeddings: [[0.1, 0.2, 0.3]] }));
+
+    await embedder.embed(['hello']);
+
+    const [, opts] = (globalThis.fetch as jest.Mock).mock.calls[0];
+    expect(opts.headers.Authorization).toBeUndefined();
+  });
 });
 
 describe('OllamaChatProvider', () => {
@@ -141,6 +162,22 @@ describe('OllamaChatProvider', () => {
     expect(result).toBe('Hello world');
     expect(mockNodeStreamPost).toHaveBeenCalledWith(
       expect.objectContaining({ url: 'http://localhost:11434/api/chat' })
+    );
+  });
+
+  test('chat: sends Authorization Bearer header through the stream when an API key is set', async () => {
+    const keyed = new OllamaChatProvider('http://localhost:11434', 'llama3.2', 'sekret');
+    mockNodeStreamPost.mockImplementation(async (opts) => {
+      opts.onLine(JSON.stringify({ message: { content: 'hi' }, done: true }));
+    });
+
+    await keyed.chat([{ role: 'user', content: 'hi' }], new AbortController().signal);
+
+    expect(mockNodeStreamPost).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: 'http://localhost:11434/api/chat',
+        headers: { Authorization: 'Bearer sekret' },
+      })
     );
   });
 

@@ -2,18 +2,28 @@ import { requestUrl } from 'obsidian';
 import { ChatMessage, EmbedResult, IChatProvider, IEmbedder, PingResult, ProviderError } from './types';
 import { nodeStreamPost } from './nodeHttp';
 
+/** Build an Authorization header when an API key is configured. */
+function authHeaders(apiKey?: string): Record<string, string> | undefined {
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined;
+}
+
 export class OllamaEmbedder implements IEmbedder {
+  private readonly auth: Record<string, string> | undefined;
+
   constructor(
     private baseUrl: string,
-    private embeddingModel: string
-  ) {}
+    private embeddingModel: string,
+    apiKey?: string
+  ) {
+    this.auth = authHeaders(apiKey);
+  }
 
   async embed(texts: string[]): Promise<EmbedResult> {
     try {
       const response = await requestUrl({
         url: `${this.baseUrl}/api/embed`,
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...this.auth },
         body: JSON.stringify({ model: this.embeddingModel, input: texts }),
         throw: false,
       });
@@ -43,7 +53,7 @@ export class OllamaEmbedder implements IEmbedder {
         const response = await requestUrl({
           url: `${this.baseUrl}/api/embeddings`,
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...this.auth },
           body: JSON.stringify({ model: this.embeddingModel, prompt: text }),
           throw: false,
         });
@@ -74,6 +84,7 @@ export class OllamaEmbedder implements IEmbedder {
       const response = await requestUrl({
         url: `${this.baseUrl}/api/tags`,
         method: 'GET',
+        headers: this.auth,
         throw: false,
       });
       if (response.status < 200 || response.status >= 300) return [];
@@ -90,6 +101,7 @@ export class OllamaEmbedder implements IEmbedder {
       const response = await requestUrl({
         url: `${this.baseUrl}/api/version`,
         method: 'GET',
+        headers: this.auth,
         throw: false,
       });
       const latencyMs = Date.now() - start;
@@ -104,10 +116,15 @@ export class OllamaEmbedder implements IEmbedder {
 }
 
 export class OllamaChatProvider implements IChatProvider {
+  private readonly auth: Record<string, string> | undefined;
+
   constructor(
     private baseUrl: string,
-    private chatModel: string
-  ) {}
+    private chatModel: string,
+    apiKey?: string
+  ) {
+    this.auth = authHeaders(apiKey);
+  }
 
   async chat(
     messages: ChatMessage[],
@@ -122,6 +139,7 @@ export class OllamaChatProvider implements IChatProvider {
         url: `${this.baseUrl}/api/chat`,
         body,
         signal,
+        headers: this.auth,
         onLine: (line) => {
           try {
             const obj = JSON.parse(line);
@@ -153,6 +171,7 @@ export class OllamaChatProvider implements IChatProvider {
       const response = await requestUrl({
         url: `${this.baseUrl}/api/tags`,
         method: 'GET',
+        headers: this.auth,
         throw: false,
       });
       if (response.status < 200 || response.status >= 300) return [];
@@ -169,6 +188,7 @@ export class OllamaChatProvider implements IChatProvider {
       const response = await requestUrl({
         url: `${this.baseUrl}/api/version`,
         method: 'GET',
+        headers: this.auth,
         throw: false,
       });
       const latencyMs = Date.now() - start;

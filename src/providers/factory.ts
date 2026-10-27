@@ -11,7 +11,7 @@ export function createEmbedder(
   onProgress?: (message: string) => void
 ): IEmbedder {
   if (settings.embeddingProvider === 'lmstudio') {
-    return new LMStudioEmbedder(settings.embeddingBaseUrl, settings.embeddingModel);
+    return new LMStudioEmbedder(settings.embeddingBaseUrl, settings.embeddingModel, settings.embeddingApiKey);
   }
   if (settings.embeddingProvider === 'onnx') {
     return new OnnxEmbedder({
@@ -21,15 +21,15 @@ export function createEmbedder(
       device: settings.onnxDevice,
     });
   }
-  return new OllamaEmbedder(settings.embeddingBaseUrl, settings.embeddingModel);
+  return new OllamaEmbedder(settings.embeddingBaseUrl, settings.embeddingModel, settings.embeddingApiKey);
 }
 
 export function createChatProvider(settings: RagPluginSettings): IChatProvider {
   if (settings.chatProvider === 'lmstudio') {
-    return new LMStudioChatProvider(settings.chatBaseUrl, settings.chatModel);
+    return new LMStudioChatProvider(settings.chatBaseUrl, settings.chatModel, settings.chatApiKey);
   }
   if (settings.chatProvider === 'cli') {
     return new CliChatProvider(settings.cliTemplate);
   }
-  return new OllamaChatProvider(settings.chatBaseUrl, settings.chatModel);
+  return new OllamaChatProvider(settings.chatBaseUrl, settings.chatModel, settings.chatApiKey);
 }

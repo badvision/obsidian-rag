@@ -19,11 +19,13 @@ export interface RagPluginSettings {
   // Embedding role — powers indexing and semantic search
   embeddingProvider: EmbeddingProviderName;
   embeddingBaseUrl: string;
+  embeddingApiKey: string;
   embeddingModel: string;
   onnxDevice: 'cpu' | 'coreml';
   // Chat role — generates answers
   chatProvider: ChatProviderName;
   chatBaseUrl: string;
+  chatApiKey: string;
   chatModel: string;
   cliPreset: CliPreset;
   cliTemplate: string;
@@ -41,10 +43,12 @@ export interface RagPluginSettings {
 export const DEFAULT_SETTINGS: RagPluginSettings = {
   embeddingProvider: 'ollama',
   embeddingBaseUrl: 'http://localhost:11434',
+  embeddingApiKey: '',
   embeddingModel: 'nomic-embed-text',
   onnxDevice: 'cpu',
   chatProvider: 'ollama',
   chatBaseUrl: 'http://localhost:11434',
+  chatApiKey: '',
   chatModel: 'llama3.2',
   cliPreset: 'opencode',
   cliTemplate: CLI_PRESETS.opencode,
@@ -205,6 +209,17 @@ export class RagSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
         );
+
+      new Setting(containerEl)
+        .setName('Embedding API Key')
+        .setDesc('Optional. Sent as a Bearer token — for remote Ollama / LM Studio endpoints that require auth')
+        .addText(text => text
+          .setValue(this.plugin.settings.embeddingApiKey)
+          .onChange(async (value: string) => {
+            this.plugin.settings.embeddingApiKey = value;
+            await this.plugin.saveSettings();
+          })
+        );
     }
 
     this.addModelDropdown(
@@ -276,6 +291,17 @@ export class RagSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.chatBaseUrl)
           .onChange(async (value: string) => {
             this.plugin.settings.chatBaseUrl = value;
+            await this.plugin.saveSettings();
+          })
+        );
+
+      new Setting(containerEl)
+        .setName('Chat API Key')
+        .setDesc('Optional. Sent as a Bearer token — for remote Ollama / LM Studio endpoints that require auth')
+        .addText(text => text
+          .setValue(this.plugin.settings.chatApiKey)
+          .onChange(async (value: string) => {
+            this.plugin.settings.chatApiKey = value;
             await this.plugin.saveSettings();
           })
         );

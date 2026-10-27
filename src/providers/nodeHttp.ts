@@ -11,6 +11,7 @@ export interface StreamPostOptions {
   url: string;
   body: string;
   signal: AbortSignal;
+  headers?: Record<string, string>;
   onLine: (line: string) => void;  // called for each complete newline-delimited chunk
 }
 
@@ -20,7 +21,7 @@ export interface StreamPostOptions {
  */
 export function nodeStreamPost(opts: StreamPostOptions): Promise<void> {
   return new Promise((resolve, reject) => {
-    const { url, body, signal, onLine } = opts;
+    const { url, body, signal, headers: extraHeaders, onLine } = opts;
     const parsed = new URL(url);
     const lib = parsed.protocol === 'https:' ? https : http;
 
@@ -33,6 +34,7 @@ export function nodeStreamPost(opts: StreamPostOptions): Promise<void> {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
+          ...extraHeaders,
         },
       },
       (res) => {

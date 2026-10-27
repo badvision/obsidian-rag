@@ -91,6 +91,31 @@ describe('LMStudioEmbedder', () => {
     expect(result.reachable).toBe(false);
     expect(result.errorMessage).toBeDefined();
   });
+
+  test('embed: sends Authorization Bearer header when an API key is set', async () => {
+    const keyed = new LMStudioEmbedder('http://localhost:1234', 'nomic-embed-text', 'sekret');
+    globalThis.fetch = jest.fn().mockResolvedValue(
+      jsonResponse(200, { data: [{ embedding: [0.1, 0.2, 0.3] }] })
+    );
+
+    await keyed.embed(['hello']);
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      'http://localhost:1234/v1/embeddings',
+      expect.objectContaining({ headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sekret' } })
+    );
+  });
+
+  test('embed: no Authorization header when no API key is set', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValue(
+      jsonResponse(200, { data: [{ embedding: [0.1] }] })
+    );
+
+    await embedder.embed(['hello']);
+
+    const [, opts] = (globalThis.fetch as jest.Mock).mock.calls[0];
+    expect(opts.headers.Authorization).toBeUndefined();
+  });
 });
 
 describe('LMStudioChatProvider', () => {
@@ -122,6 +147,23 @@ describe('LMStudioChatProvider', () => {
     expect(result).toBe('Hello world');
     expect(mockNodeStreamPost).toHaveBeenCalledWith(
       expect.objectContaining({ url: 'http://localhost:1234/v1/chat/completions' })
+    );
+  });
+
+  test('chat: sends Authorization Bearer header through the stream when an API key is set', async () => {
+    const keyed = new LMStudioChatProvider('http://localhost:1234', 'llama3.2', 'sekret');
+    mockNodeStreamPost.mockImplementation(async (opts) => {
+      opts.onLine('data: ' + JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }));
+      opts.onLine('data: [DONE]');
+    });
+
+    await keyed.chat([{ role: 'user', content: 'hi' }], new AbortController().signal);
+
+    expect(mockNodeStreamPost).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: 'http://localhost:1234/v1/chat/completions',
+        headers: { Authorization: 'Bearer sekret' },
+      })
     );
   });
 

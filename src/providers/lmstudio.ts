@@ -2,18 +2,28 @@ import { requestUrl } from 'obsidian';
 import { ChatMessage, EmbedResult, IChatProvider, IEmbedder, PingResult, ProviderError } from './types';
 import { nodeStreamPost } from './nodeHttp';
 
+/** Build an Authorization header when an API key is configured. */
+function authHeaders(apiKey?: string): Record<string, string> | undefined {
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined;
+}
+
 export class LMStudioEmbedder implements IEmbedder {
+  private readonly auth: Record<string, string> | undefined;
+
   constructor(
     private baseUrl: string,
-    private embeddingModel: string
-  ) {}
+    private embeddingModel: string,
+    apiKey?: string
+  ) {
+    this.auth = authHeaders(apiKey);
+  }
 
   async embed(texts: string[]): Promise<EmbedResult> {
     try {
       const response = await requestUrl({
         url: `${this.baseUrl}/v1/embeddings`,
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...this.auth },
         body: JSON.stringify({ model: this.embeddingModel, input: texts }),
         throw: false,
       });
@@ -45,6 +55,7 @@ export class LMStudioEmbedder implements IEmbedder {
       const response = await requestUrl({
         url: `${this.baseUrl}/v1/models`,
         method: 'GET',
+        headers: this.auth,
         throw: false,
       });
       if (response.status < 200 || response.status >= 300) return [];
@@ -61,6 +72,7 @@ export class LMStudioEmbedder implements IEmbedder {
       const response = await requestUrl({
         url: `${this.baseUrl}/v1/models`,
         method: 'GET',
+        headers: this.auth,
         throw: false,
       });
       const latencyMs = Date.now() - start;
@@ -75,10 +87,15 @@ export class LMStudioEmbedder implements IEmbedder {
 }
 
 export class LMStudioChatProvider implements IChatProvider {
+  private readonly auth: Record<string, string> | undefined;
+
   constructor(
     private baseUrl: string,
-    private chatModel: string
-  ) {}
+    private chatModel: string,
+    apiKey?: string
+  ) {
+    this.auth = authHeaders(apiKey);
+  }
 
   async chat(
     messages: ChatMessage[],
@@ -94,6 +111,7 @@ export class LMStudioChatProvider implements IChatProvider {
         url: `${this.baseUrl}/v1/chat/completions`,
         body,
         signal,
+        headers: this.auth,
         onLine: (line) => {
           if (done) return;
           const trimmed = line.trim();
@@ -130,6 +148,7 @@ export class LMStudioChatProvider implements IChatProvider {
       const response = await requestUrl({
         url: `${this.baseUrl}/v1/models`,
         method: 'GET',
+        headers: this.auth,
         throw: false,
       });
       if (response.status < 200 || response.status >= 300) return [];
@@ -146,6 +165,7 @@ export class LMStudioChatProvider implements IChatProvider {
       const response = await requestUrl({
         url: `${this.baseUrl}/v1/models`,
         method: 'GET',
+        headers: this.auth,
         throw: false,
       });
       const latencyMs = Date.now() - start;

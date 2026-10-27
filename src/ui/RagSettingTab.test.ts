@@ -362,6 +362,16 @@ describe('RagSettingTab', () => {
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
   });
 
+  test('embedding API key text onChange: updates settings.embeddingApiKey and saves', async () => {
+    const settings = captureSettingCallbacks(tab);
+    const text = byName(settings, 'Embedding API Key');
+
+    await text.onChangeText!('sk-embed-123');
+
+    expect(mockPlugin.settings.embeddingApiKey).toBe('sk-embed-123');
+    expect(mockPlugin.saveSettings).toHaveBeenCalled();
+  });
+
   test('chat base URL text onChange: updates settings.chatBaseUrl and saves', async () => {
     const settings = captureSettingCallbacks(tab);
     const text = byName(settings, 'Chat Base URL');
@@ -369,6 +379,16 @@ describe('RagSettingTab', () => {
     await text.onChangeText!('http://localhost:9999');
 
     expect(mockPlugin.settings.chatBaseUrl).toBe('http://localhost:9999');
+    expect(mockPlugin.saveSettings).toHaveBeenCalled();
+  });
+
+  test('chat API key text onChange: updates settings.chatApiKey and saves', async () => {
+    const settings = captureSettingCallbacks(tab);
+    const text = byName(settings, 'Chat API Key');
+
+    await text.onChangeText!('sk-chat-456');
+
+    expect(mockPlugin.settings.chatApiKey).toBe('sk-chat-456');
     expect(mockPlugin.saveSettings).toHaveBeenCalled();
   });
 
